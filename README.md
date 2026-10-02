@@ -98,9 +98,9 @@ The latest compiled releases can also be downloaded directly from the GitHub Rel
 - ✅ Player Movement
 - ✅ Teleportation
 - ✅ Gamemode
-- ✅ Health
-- ✅ Hunger
-- ✅ Permissions
+- ❌ Health
+- ❌ Hunger
+- ❌ Permissions
 
 ---
 
@@ -124,7 +124,7 @@ The latest compiled releases can also be downloaded directly from the GitHub Rel
 
 ## Commands
 
-- ✅ Command Framework
+- ❌ Command Framework
 - ✅ Built-in Commands
 
 ---
@@ -211,3 +211,5 @@ If you would like to contribute to the project, feel free to open an Issue or su
 # License
 
 This project is released under the **MIT License**.
+
+یه ایرانی اینو ساخته! البته وایبکدشده به کسی نگیا
