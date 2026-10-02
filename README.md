@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/logo (1).png" width="220" alt="Pywer Logo">
+  <img src="docs/file_00000000e384820a930746c2663502fb.png" width="220" alt="Pywer Logo">
 </p>
 
 <h1 align="center">Pywer</h1>
