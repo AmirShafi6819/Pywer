@@ -5,48 +5,56 @@
 <h1 align="center">Pywer</h1>
 
 <p align="center">
-A lightweight, high-performance Minecraft Bedrock server software written entirely in Python.
+  A lightweight, high-performance Minecraft Bedrock server software written entirely in Python.
 </p>
 
 <p align="center">
   <img src="https://img.shields.io/badge/Python-3.10+-3776AB?style=for-the-badge&logo=python&logoColor=white">
   <img src="https://img.shields.io/badge/Bedrock-1.21.50-3CB371?style=for-the-badge">
-  <img src="https://img.shields.io/badge/Status-In%20Development-orange?style=for-the-badge">
+  <img src="https://img.shields.io/badge/Status-Development-orange?style=for-the-badge">
   <img src="https://img.shields.io/badge/License-MIT-blue?style=for-the-badge">
 </p>
 
 ---
 
-# ✨ About
+# Overview
 
-**Pywer** is a modern Minecraft Bedrock server software written entirely in **Python**.
+**Pywer** is an experimental Minecraft Bedrock server implementation written entirely in **Python**.
 
-Unlike traditional server software, Pywer is designed to be:
+The project focuses on delivering a clean, maintainable and high-performance server architecture while remaining lightweight enough to run on both desktop and mobile environments.
 
-- 🚀 Extremely fast
-- 📦 Single-file architecture
-- 📱 Runs on Android phones (Termux/Pydroid)
-- 🐍 Installable with `pip`
-- 🧩 Clean and easy to extend
-- ❤️ Built from scratch
+Unlike traditional server software, Pywer is distributed as a single Python package and can be installed directly using **pip**.
 
-Current supported protocol:
+Current protocol support:
 
-> **Minecraft Bedrock 1.21.50**
+**Minecraft Bedrock 1.21.50**
 
-> ⚠️ The project is still under active development.
+> **Status:** Active Development
 
 ---
 
-# 📥 Installation
+# Features
 
-## Install using pip
+- High-performance asynchronous networking
+- Pure Python implementation
+- Single-file architecture
+- Installable through `pip`
+- Android compatible (Termux / Pydroid)
+- Cross-platform
+- Lightweight and easy to deploy
+- Designed for future extensibility
+
+---
+
+# Installation
+
+## Install from PyPI
 
 ```bash
 pip install pywer
 ```
 
-Run:
+Run the server:
 
 ```bash
 pywer
@@ -54,27 +62,23 @@ pywer
 
 ---
 
-## Download Release
+## Install from Releases
 
-You can also download the latest release from the **Releases** page.
-
-Download → Extract → Run.
+The latest compiled releases can also be downloaded directly from the GitHub Releases page.
 
 ---
 
-# ✅ Current Progress
+# Implementation Status
 
-## Core
+## Networking
 
-- ✅ Networking
-- ✅ Packet System
-- ✅ Login
-- ✅ Start Game
-- ✅ Resource Pack Handling
-- ✅ Compression
-- ✅ Encryption
 - ✅ RakNet
+- ✅ Packet System
+- ✅ Login Sequence
+- ✅ Encryption
+- ✅ Compression
 - ✅ Tick System
+- ✅ StartGame
 
 ---
 
@@ -83,19 +87,19 @@ Download → Extract → Run.
 - ✅ World Loading
 - ✅ Chunk Generation
 - ✅ Chunk Sending
-- ✅ Block Updates
 - ✅ Runtime IDs
+- ✅ Block Updates
 
 ---
 
 ## Player
 
 - ✅ Player Spawn
-- ✅ Movement
-- ✅ Teleport
+- ✅ Player Movement
+- ✅ Teleportation
+- ✅ Gamemode
 - ✅ Health
 - ✅ Hunger
-- ✅ Gamemode
 - ✅ Permissions
 
 ---
@@ -104,9 +108,8 @@ Download → Extract → Run.
 
 - ✅ Inventory
 - ✅ Hotbar
-- ✅ Containers
 - ✅ Equipment
-- ✅ Item Stack
+- ✅ Containers
 - ✅ Item Transactions
 
 ---
@@ -114,37 +117,36 @@ Download → Extract → Run.
 ## Items
 
 - ✅ Item System
-- ✅ Item Components
 - ✅ Item Serialization
+- ✅ Item Components
 
 ---
 
 ## Commands
 
-- ✅ Command Manager
-- ✅ Basic Commands
+- ✅ Command Framework
+- ✅ Built-in Commands
 
 ---
 
-## API
+## Not Yet Implemented
+
+### API
 
 - ❌ Plugin API
 - ❌ Event System
-- ❌ Scheduler API
+- ❌ Scheduler
+- ❌ Permissions API
 
----
+### Entities
 
-## Entities
-
-- ❌ Mobs
+- ❌ Entity System
+- ❌ Mob AI
 - ❌ Animals
 - ❌ Monsters
 - ❌ NPCs
-- ❌ Entity AI
 
----
-
-## Gameplay
+### Gameplay
 
 - 🚧 Crafting
 - 🚧 Redstone
@@ -155,34 +157,57 @@ Download → Extract → Run.
 
 ---
 
-# 🎯 Goals
+# Architecture
 
-- Fastest Python Bedrock server
-- Simple architecture
-- Easy plugin development
-- Mobile friendly
-- Cross-platform
-- Open Source
+Pywer is designed around a modern asynchronous architecture with a strong emphasis on simplicity and maintainability.
 
----
+Core design goals include:
 
-# 📱 Platforms
-
-- ✅ Windows
-- ✅ Linux
-- ✅ macOS
-- ✅ Android
+- Clean codebase
+- Minimal dependencies
+- High performance
+- Low memory usage
+- Cross-platform compatibility
+- Mobile support
+- Easy future expansion
 
 ---
 
-# ❤️ Contributing
+# Supported Platforms
 
-Pull Requests and Issues are always welcome!
+| Platform | Status |
+|----------|:------:|
+| Windows | ✅ |
+| Linux | ✅ |
+| macOS | ✅ |
+| Android | ✅ |
 
 ---
 
-# ⭐ Support
+# Roadmap
 
-If you like this project, don't forget to leave a **Star ⭐** on GitHub.
+Upcoming milestones include:
 
-It helps the project grow.
+- Plugin API
+- Event System
+- Entity Engine
+- Mob AI
+- Scoreboard
+- Redstone Simulation
+- Crafting System
+- World Persistence Improvements
+- Performance Optimizations
+
+---
+
+# Contributing
+
+Contributions, suggestions and bug reports are always welcome.
+
+If you would like to contribute to the project, feel free to open an Issue or submit a Pull Request.
+
+---
+
+# License
+
+This project is released under the **MIT License**.
