@@ -151,8 +151,10 @@ from ..protocol.packet_ids import (
 from ..protocol.transaction import (
     ACTION_ATTACK,
     ACTION_CLICK_BLOCK,
+    ACTION_CLICK_AIR,
     TX_USE_ITEM,
     TX_USE_ITEM_ON_ENTITY,
+    TX_RELEASE_ITEM,
     parse_inventory_transaction,
     read_block_pos,
 )
@@ -173,6 +175,10 @@ from ..world.blocks import (
 from ..world.chunk import build_chunk
 from ..world.query import get_block, is_solid
 from ..world.terrain import SPAWN
+
+BOW_IDS = {261, 324, ITEM_RUNTIME.get("bow", 324)}
+ARROW_IDS = {262, 325, ITEM_RUNTIME.get("arrow", 325)}
+SNOWBALL_IDS = {332, 399, ITEM_RUNTIME.get("snowball", 399)}
 from .containers import (
     CONTAINER_ARMOR,
     CONTAINER_INVENTORY,
@@ -1037,15 +1043,18 @@ class Session:
                                 self.selected_slot,
                                 self._held_slot_item() or ITEM_AIR,
                             )
-                        if tx_type == TX_USE_ITEM_ON_ENTITY and tx["action"] == ACTION_ATTACK:
+                            if not self.handle_use_item(tx):
+                                if tx["action"] == ACTION_CLICK_BLOCK:
+                                    self.try_place_block(tx)
+                        elif tx_type == TX_USE_ITEM_ON_ENTITY and tx["action"] == ACTION_ATTACK:
                             self.srv.handle_entity_attack(
                                 self,
                                 tx["target_rid"],
                                 tx["player_pos"],
                                 tx["click_pos"],
                             )
-                        elif tx_type == TX_USE_ITEM and tx["action"] == ACTION_CLICK_BLOCK:
-                            self.try_place_block(tx)
+                        elif tx_type == TX_RELEASE_ITEM:
+                            self.handle_release_item(tx)
                 except Exception as e:
                     dbg("Inventory", "bad InventoryTransaction: %r" % e)
         elif pid == PID_REQ_RADIUS:
@@ -1671,6 +1680,116 @@ class Session:
             return
         self.inventory[slot] = item_tuple(item[0], item[1] - 1, item[2])
         self.sync_inventory_slots([slot])
+
+    def handle_release_item(self, tx):
+        """Handles ReleaseItemTransactionData (e.g. bow release)."""
+        action = tx.get("action", 0) if isinstance(tx, dict) else 0
+        if action != 0:
+            return False
+
+        held_item = self._held_slot_item()
+        tx_item = tx.get("item", {}) if isinstance(tx, dict) else {}
+        tx_item_id = tx_item.get("id") if isinstance(tx_item, dict) else None
+
+        held_id = held_item[0] if held_item else None
+        item_id = tx_item_id or held_id
+
+        if item_id not in BOW_IDS:
+            return False
+
+        is_creative = (
+            self.gamemode_is_creative()
+            if hasattr(self, "gamemode_is_creative")
+            else False
+        )
+
+        if not is_creative:
+            arrow_slot = None
+            for slot_idx, itm in enumerate(self.inventory):
+                if itm and itm[0] in ARROW_IDS and itm[1] > 0:
+                    arrow_slot = slot_idx
+                    break
+            if arrow_slot is None:
+                return False
+
+            aid, acnt, admg = self.inventory[arrow_slot]
+            if acnt <= 1:
+                self.inventory[arrow_slot] = ITEM_AIR
+            else:
+                self.inventory[arrow_slot] = (aid, acnt - 1, admg)
+            try:
+                self.sync_inventory_slots([arrow_slot])
+            except Exception:
+                pass
+
+        pitch_rad = math.radians(self.pitch)
+        yaw_rad = math.radians(self.yaw)
+        speed = 3.0
+        vx = -math.sin(yaw_rad) * math.cos(pitch_rad) * speed
+        vy = -math.sin(pitch_rad) * speed
+        vz = math.cos(yaw_rad) * math.cos(pitch_rad) * speed
+
+        fx, fy, fz = self.feet()
+        spawn_pos = (fx, fy + 1.62, fz)
+        if hasattr(self.srv, "entity_mgr"):
+            from ..entity.projectile import Arrow
+
+            self.srv.entity_mgr.spawn(
+                Arrow,
+                shooter_rid=self.rid,
+                pos=spawn_pos,
+                motion=(vx, vy, vz),
+            )
+        return True
+
+    def handle_use_item(self, tx):
+        """Handles UseItemTransactionData for projectiles like snowballs."""
+        held_item = self._held_slot_item()
+        tx_item = tx.get("item", {}) if isinstance(tx, dict) else {}
+        tx_item_id = tx_item.get("id") if isinstance(tx_item, dict) else None
+
+        held_id = held_item[0] if held_item else None
+        item_id = tx_item_id or held_id
+
+        if item_id in SNOWBALL_IDS:
+            is_creative = (
+                self.gamemode_is_creative()
+                if hasattr(self, "gamemode_is_creative")
+                else False
+            )
+            if not is_creative:
+                slot = self.selected_slot
+                if 0 <= slot < len(self.inventory):
+                    sid, scnt, sdmg = self.inventory[slot]
+                    if scnt <= 1:
+                        self.inventory[slot] = ITEM_AIR
+                    else:
+                        self.inventory[slot] = (sid, scnt - 1, sdmg)
+                    try:
+                        self.sync_inventory_slots([slot])
+                    except Exception:
+                        pass
+
+            pitch_rad = math.radians(self.pitch)
+            yaw_rad = math.radians(self.yaw)
+            speed = 1.5
+            vx = -math.sin(yaw_rad) * math.cos(pitch_rad) * speed
+            vy = -math.sin(pitch_rad) * speed
+            vz = math.cos(yaw_rad) * math.cos(pitch_rad) * speed
+            fx, fy, fz = self.feet()
+            spawn_pos = (fx, fy + 1.62, fz)
+            if hasattr(self.srv, "entity_mgr"):
+                from ..entity.projectile import Snowball
+
+                self.srv.entity_mgr.spawn(
+                    Snowball,
+                    shooter_rid=self.rid,
+                    pos=spawn_pos,
+                    motion=(vx, vy, vz),
+                )
+            return True
+        return False
+
 
     def play_sound_at(self, x, y, z, sound, volume=1.0, pitch=1.0):
         self.srv.broadcast(

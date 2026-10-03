@@ -118,3 +118,39 @@ def build_mob_equipment(rid, item, inventory_slot, hotbar_slot, window_id, stack
     w.write_u8(hotbar_slot)
     w.write_u8(window_id)
     return w.get()
+
+
+def build_add_actor(entity):
+    """AddActorPacket (PID 13) for non-player actors (mobs, projectiles)."""
+    from .metadata import write_metadata
+
+    w = ByteWriter()
+    w.write_varint64(entity.rid)
+    w.write_varuint64(entity.rid)
+    w.write_string(entity.identifier)
+    write_vec3(w, entity.pos)
+    write_vec3(w, entity.motion)
+    w.write_float(entity.pitch)
+    w.write_float(entity.yaw)
+    w.write_float(entity.head_yaw)
+    w.write_varuint32(0)  # attributes count
+
+    md = [
+        (0, 7, 0),
+        (38, 3, 1.0),
+        (53, 3, float(entity.width)),
+        (54, 3, float(entity.height)),
+    ]
+    write_metadata(w, sorted(md, key=lambda e: e[0]))
+    w.write_varuint32(0)  # synced property ints
+    w.write_varuint32(0)  # synced property floats
+    w.write_varuint32(0)  # entity links
+    return w.get()
+
+
+def build_remove_actor(rid):
+    """RemoveActorPacket (PID 14) despawning an actor on clients."""
+    w = ByteWriter()
+    w.write_varint64(rid)
+    return w.get()
+

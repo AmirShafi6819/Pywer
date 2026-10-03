@@ -114,6 +114,9 @@ ITEM_RUNTIME = {
         "stick",
         "flint",
         "shears",
+        "bow",
+        "arrow",
+        "snowball",
     )
 }
 ITEM_RUNTIME.update({k: v for k, v in ((name, item_runtime_id(name)) for name in TOOLS) if v is not None})
