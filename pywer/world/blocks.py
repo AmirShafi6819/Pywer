@@ -85,7 +85,7 @@ TOOL_TIERS = {
 
 # item key -> (tool type, harvest level, mining speed)
 TOOLS = {}
-for _kind, _bit in (("pickaxe", TOOL_PICKAXE), ("axe", TOOL_AXE), ("shovel", TOOL_SHOVEL)):
+for _kind, _bit in (("sword", TOOL_SWORD), ("pickaxe", TOOL_PICKAXE), ("axe", TOOL_AXE), ("shovel", TOOL_SHOVEL), ("hoe", TOOL_HOE)):
     for _tier, (_lvl, _speed) in TOOL_TIERS.items():
         TOOLS["%s_%s" % (_tier, _kind)] = (_bit, _lvl, _speed)
 TOOLS["shears"] = (TOOL_SHEARS, 1, 15)
