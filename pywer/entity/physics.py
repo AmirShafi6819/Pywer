@@ -148,6 +148,13 @@ def check_projectile_collisions(
     for ent in nearby_entities:
         if ent is projectile or ent.dead:
             continue
+        # Projectiles do not collide with other projectiles or dropped items
+        from .projectile import Projectile
+        from .item import ItemEntity
+
+        if isinstance(ent, (Projectile, ItemEntity)):
+            continue
+
         # Immunity for shooter during the first 0.25s (approx 5 ticks)
         if getattr(projectile, "shooter_rid", None) is not None:
             if ent.rid == projectile.shooter_rid and getattr(projectile, "age", 0.0) < 0.25:

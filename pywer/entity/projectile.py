@@ -37,8 +37,9 @@ class Projectile(Entity):
 
     def on_hit_entity(self, target, hit_pos):
         self.pos = hit_pos
-        if hasattr(target, "damage"):
-            target.damage(self.damage, source_rid=self.shooter_rid)
+        damage_fn = getattr(target, "damage", None)
+        if callable(damage_fn):
+            damage_fn(self.damage, source_rid=self.shooter_rid)
         self.dead = True
 
     def tick(self, now, dt, world_is_solid):
@@ -49,10 +50,14 @@ class Projectile(Entity):
                 self.dead = True
             return False
 
+        vx, vy, vz = self.motion
+        motion_len = math.sqrt(vx * vx + vy * vy + vz * vz)
+        query_radius = max(4.0, motion_len + 1.0)
+
         # Collision query along trajectory
         nearby = []
         if hasattr(self.srv, "entity_mgr") and hasattr(self.srv.entity_mgr, "entities_near"):
-            nearby = self.srv.entity_mgr.entities_near(self.pos, radius=4.0)
+            nearby = self.srv.entity_mgr.entities_near(self.pos, radius=query_radius)
 
         from .physics import check_projectile_collisions
         hit_type, target_or_block, hit_pos = check_projectile_collisions(self, nearby, world_is_solid)
