@@ -183,6 +183,30 @@ class PluginBase:
             return None
         return None
 
+    @property
+    def scheduler(self) -> Any:
+        if self._server and hasattr(self._server, "scheduler"):
+            return self._server.scheduler
+        return None
+
+    def run_later(self, delay_ticks: int, task: Any) -> Any:
+        """Schedules a synchronous task to run on the main server thread after delay_ticks."""
+        if self.scheduler:
+            return self.scheduler.run_later(delay_ticks, task, plugin=self)
+        return None
+
+    def run_repeating(self, delay_ticks: int, period_ticks: int, task: Any) -> Any:
+        """Schedules a synchronous repeating task to run on the main server thread."""
+        if self.scheduler:
+            return self.scheduler.run_repeating(delay_ticks, period_ticks, task, plugin=self)
+        return None
+
+    def run_async(self, worker_fn: Any, on_complete: Any = None) -> Any:
+        """Executes worker_fn in background thread and posts on_complete to the main server thread."""
+        if self.scheduler:
+            return self.scheduler.run_async(worker_fn, on_complete=on_complete, plugin=self)
+        return None
+
     def register_listener(self, listener: Any) -> None:
         """Helper to register an event listener scoped to this plugin."""
         if self._server and hasattr(self._server, "event_manager") and self._server.event_manager:

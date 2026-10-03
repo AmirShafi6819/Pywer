@@ -45,6 +45,7 @@ from ..event import manager as events, PlayerJoinEvent, PlayerQuitEvent
 from .worker import WorkerPool
 from ..entity.manager import EntityManager
 from ..world.cache import ChunkCache
+from ..scheduler import ServerScheduler
 
 TICK_INTERVAL = 0.05
 MAX_CATCHUP_TICKS = 5
@@ -76,6 +77,7 @@ class Server:
         self.chests = {}
         self.worker_pool = WorkerPool()
         self.chunk_cache = ChunkCache()
+        self.scheduler = ServerScheduler(self)
         self._next_tick = time.perf_counter() + TICK_INTERVAL
         self.load_world()
         self.motd = "MCPE;pywer-v0.9.1dev;%d;%s;0;1;%d;Minimal;Creative;1;%d;%d;" % (
@@ -481,6 +483,7 @@ class Server:
     def tick(self, now=None):
         """Single tick iteration (20.0 TPS)."""
         now = time.time() if now is None else now
+        self.scheduler.tick()
         self.drain_workers()
         if now - self._last_save >= SAVE_INTERVAL:
             self.save_all()
@@ -517,6 +520,7 @@ class Server:
 
     def stop(self):
         """Cleanly shut down worker pool, save world, and close socket."""
+        self.scheduler.shutdown()
         self.save_all(force=True)
         self.worker_pool.shutdown()
         try:
