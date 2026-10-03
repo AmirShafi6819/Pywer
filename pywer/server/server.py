@@ -1,7 +1,7 @@
 # ---------------------------------------------------------------- server
 """Main Bedrock UDP server, session manager, world event loop, and player dispatch."""
 
-import math
+from pathlib import Path
 import random
 import select
 import socket
@@ -90,7 +90,7 @@ class Server:
         self.plugin_manager = self.plugin_mgr
         self.plugin_mgr.load_all_plugins()
         self.plugin_mgr.enable_all()
-        self.event_mgr.call(ServerLoadEvent())
+        self.event_mgr.call(ServerLoadEvent(self))
         self._next_tick = time.perf_counter() + TICK_INTERVAL
         self.load_world()
         self.motd = "MCPE;pywer-v0.9.1dev;%d;%s;0;1;%d;Minimal;Creative;1;%d;%d;" % (

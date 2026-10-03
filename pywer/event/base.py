@@ -1,7 +1,7 @@
 """Core event definitions, priority levels, and listener decorators."""
 
 from enum import IntEnum
-from typing import Callable, Optional
+from typing import Callable, Any
 
 
 class EventPriority(IntEnum):
