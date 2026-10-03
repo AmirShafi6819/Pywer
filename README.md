@@ -94,8 +94,8 @@ WaterdogPE `config.yml` (key names may vary slightly between versions):
 servers:
   pywer:
     address: 127.0.0.1:19133
-online_mode: true        # Xbox auth happens on the proxy
-use_login_extras: true   # Pywer reads Waterdog_IP / Waterdog_XUID (false also works)
+online_mode: false
+use_login_extras: false
 ```
 
 Pywer is always offline (it never verifies the login chain), so no `xbox-auth` switch is needed.
