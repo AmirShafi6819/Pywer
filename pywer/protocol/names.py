@@ -98,5 +98,8 @@ PACKET_NAMES = {
     "SEND_PARTY_DESTINATION_COOKIE_PACKET", 350: "PARTY_DESTINATION_COOKIE_RESPONSE_PACKET"
 }
 
+
 def packet_name(pid):
+    """Return human-readable packet name for given packet id."""
     return PACKET_NAMES.get(pid, "UNKNOWN_%d" % pid)
+
