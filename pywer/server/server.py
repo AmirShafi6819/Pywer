@@ -42,6 +42,11 @@ from ..packets.text import build_text
 from ..player.movement import NETWORK_EYE_OFFSET
 from ..player.session import Session
 from ..event import manager as events, PlayerJoinEvent, PlayerQuitEvent
+from .worker import WorkerPool
+from ..world.cache import ChunkCache
+
+TICK_INTERVAL = 0.05
+MAX_CATCHUP_TICKS = 5
 
 
 class Server:
@@ -66,6 +71,9 @@ class Server:
         self.player_storage = PlayerStorage()
         self._last_save = time.time()
         self._window_id = CONTAINER_ID_FIRST
+        self.worker_pool = WorkerPool()
+        self.chunk_cache = ChunkCache()
+        self._next_tick = time.perf_counter() + TICK_INTERVAL
         self.load_world()
         self.motd = "MCPE;pywer-v0.9.1dev;%d;%s;0;1;%d;Minimal;Creative;1;%d;%d;" % (
             config.PROTOCOL,
@@ -325,6 +333,7 @@ class Server:
         cx, cz = x >> 4, z >> 4
         EDITS.setdefault((cx, cz), {})[(x & 15, y, z & 15)] = key
         CHUNK_CACHE.pop((cx, cz), None)
+        self.chunk_cache.invalidate(cx, cz)
         mark_dirty(cx, cz)
         self.broadcast([Session._pk(PID_UPDATE_BLOCK, build_update_block(x, y, z, key))])
         return True
@@ -490,28 +499,43 @@ class Server:
             log("Storage", "could not save %s: %r" % (p.name, e))
         log("Player", "%s left" % p.name)
 
-    def step(self, timeout=0.02):
-        rl, _, _ = select.select([self.sock], [], [], timeout)
-        if rl:
-            for _ in range(256):
-                try:
-                    data, addr = self.sock.recvfrom(4096)
-                except (BlockingIOError, InterruptedError):
-                    break
-                except OSError:
-                    break
-                if not data:
-                    continue
-                try:
-                    if data[0] & 0x80:
-                        s = self.sessions.get(addr)
-                        if s:
-                            s.on_datagram(data)
-                    else:
-                        self.unconnected(data, addr)
-                except Exception as e:
-                    log("RakNet", "error handling packet from %s: %r" % (addr, e))
-        now = time.time()
+    def drain_workers(self):
+        """Drain completed worker results and dispatch to active sessions."""
+        for task_type, session_id, res in self.worker_pool.drain_results():
+            if task_type == "CHUNK":
+                cx, cz, payload = res
+                self.chunk_cache.put(cx, cz, payload)
+                for s in self.sessions.values():
+                    if s.rid == session_id:
+                        if hasattr(s, "on_chunk_ready"):
+                            s.on_chunk_ready(cx, cz, payload)
+                        break
+
+    def drain_socket(self):
+        """Drain all pending UDP datagrams in non-blocking mode."""
+        while True:
+            try:
+                data, addr = self.sock.recvfrom(65535)
+            except (BlockingIOError, InterruptedError):
+                break
+            except OSError:
+                break
+            if not data:
+                continue
+            try:
+                if data[0] & 0x80:
+                    s = self.sessions.get(addr)
+                    if s:
+                        s.on_datagram(data)
+                else:
+                    self.unconnected(data, addr)
+            except Exception as e:
+                log("RakNet", "error handling packet from %s: %r" % (addr, e))
+
+    def tick(self, now=None):
+        """Single tick iteration (20.0 TPS)."""
+        now = time.time() if now is None else now
+        self.drain_workers()
         if now - self._last_save >= SAVE_INTERVAL:
             self.save_all()
         dt = min(0.1, max(0.0, now - self._last_tick)) if self._last_tick else 0.0
@@ -526,6 +550,30 @@ class Server:
                 del self.sessions[a]
                 self.on_leave(s)
 
+    def step(self, timeout=None):
+        """Single loop step with socket draining and monotonic tick pacing."""
+        now_perf = time.perf_counter()
+        if timeout is None:
+            timeout = max(0.0, min(TICK_INTERVAL, self._next_tick - now_perf))
+        rl, _, _ = select.select([self.sock], [], [], timeout)
+        if rl:
+            self.drain_socket()
+        now_perf = time.perf_counter()
+        if now_perf >= self._next_tick:
+            self.tick()
+            self._next_tick += TICK_INTERVAL
+            if now_perf - self._next_tick > MAX_CATCHUP_TICKS * TICK_INTERVAL:
+                self._next_tick = now_perf + TICK_INTERVAL
+
     def run(self, stop=None):
         while not (stop and stop.is_set()):
             self.step()
+
+    def stop(self):
+        """Cleanly shut down worker pool, save world, and close socket."""
+        self.save_all(force=True)
+        self.worker_pool.shutdown()
+        try:
+            self.sock.close()
+        except OSError:
+            pass
