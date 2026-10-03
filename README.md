@@ -36,8 +36,7 @@ Current protocol support:
 # Features
 
 - High-performance asynchronous networking
-- Pure Python implementation
-- Single-file architecture
+- Pure Python implementation, standard library only
 - Installable through `pip`
 - Android compatible (Termux / Pydroid)
 - Cross-platform
@@ -97,20 +96,21 @@ The latest compiled releases can also be downloaded directly from the GitHub Rel
 - ✅ Player Spawn
 - ✅ Player Movement
 - ✅ Teleportation
-- ✅ Gamemode
-- ❌ Health
-- ❌ Hunger
+- ✅ Gamemode (per player)
+- ✅ Health & damage (PvP)
+- ✅ Knockback
+- ⚠️ Hunger not simulated
 - ❌ Permissions
 
 ---
 
 ## Inventory
 
-- ✅ Inventory
-- ✅ Hotbar
-- ✅ Equipment
-- ✅ Containers
-- ✅ Item Transactions
+- ✅ Inventory & hotbar (server authoritative)
+- ✅ Item stack ids & client prediction sync
+- ✅ Move / split / merge / swap / drop with validation
+- ✅ Container open/close (E key)
+- ⚠️ Equipment & crafting containers not implemented
 
 ---
 
@@ -118,7 +118,14 @@ The latest compiled releases can also be downloaded directly from the GitHub Rel
 
 - ✅ Item System
 - ✅ Item Serialization
-- ✅ Item Components
+- ✅ Full item type dictionary (BedrockData 1.21.50)
+- ✅ Dropped item entities: gravity, drag, bounce, merge, pickup delay, despawn
+- ✅ Tool tiers affecting break speed and drops
+
+## World
+
+- ✅ Persistence (seed, block edits, dirty-chunk tracking)
+- ✅ Player persistence keyed by UUID (position, rotation, gamemode, health, inventory, hotbar)
 
 ---
 
@@ -154,6 +161,11 @@ The latest compiled releases can also be downloaded directly from the GitHub Rel
 - 🚧 Time
 - 🚧 Scoreboard
 - 🚧 Boss Bars
+
+### Chat commands
+
+`!blocks` `!items` `!tools` `!give <item> [n] [slot]` `!inv`
+`!setblock <x|~> <y|~> <z|~> <block>` `!tp <x|~> <y|~> <z|~>` `!pos`
 
 ---
 
