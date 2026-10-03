@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pywer"
+version = "0.9.1.dev0"
+description = "Pure Python standard library Minecraft Bedrock 1.21.50 (protocol 766) server"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+    { name = "EXBY" },
+    { name = "ManiTheFerfri" },
+]
+keywords = ["minecraft", "bedrock", "server", "pure-python", "raknet"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+[project.scripts]
+pywer = "pywer.server.main:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["pywer*"]
