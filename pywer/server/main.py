@@ -15,7 +15,8 @@ def _env_bool(name):
 def main():
     ap = argparse.ArgumentParser(prog="pywer")
     ap.add_argument("port", nargs="?", type=int, default=config.PORT, help="UDP port (default %d)" % config.PORT)
-    ap.add_argument("--bind", default=os.environ.get("PYWER_BIND", "0.0.0.0"), help="address to bind (default 0.0.0.0)")
+    ap.add_argument("--bind", default=os.environ.get("PYWER_BIND", config.BIND),
+                    help="address to bind (default %s)" % config.BIND)
     ap.add_argument("--proxy", action="store_true", help="run behind WaterdogPE (reads Waterdog_IP/Waterdog_XUID)")
     ap.add_argument("--no-encryption", action="store_true", help="disable packet encryption (proxy mode only)")
     args = ap.parse_args()

@@ -1,0 +1,74 @@
+# pywer.yml - Pywer advanced configuration
+#
+# Settings for people working on the server itself. server.properties is the file to edit
+# for everyday play; this one is for protocol, world generation, streaming and debugging.
+# Values are 'key: value', grouped by section. '#' starts a comment.
+# Delete a line to fall back to the default shown here.
+
+network:
+  # Encrypt packets with the client. Turn off only to inspect traffic on a trusted network.
+  encryption: true
+
+  # Batch size in bytes above which a packet is zlib compressed.
+  compression-threshold: 256
+
+proxy:
+  # The server sits behind a proxy such as WaterdogPE, which already authenticated the player.
+  mode: false
+
+  # Encrypt the proxy connection. null keeps the network.encryption value.
+  encryption: null
+
+protocol:
+  # Bedrock protocol number. 766 = 1.21.50. Clients on another protocol cannot join.
+  version: 766
+
+  # Game version reported to the client, must match the protocol above.
+  game-version: 1.21.50
+
+world:
+  # Generate terrain. False gives an empty world at the spawn below, which isolates terrain bugs.
+  terrain: true
+
+  # Lowest buildable Y of the overworld.
+  min-y: -64
+
+  # Highest buildable Y of the overworld.
+  max-y: 319
+
+  # Y of the water surface.
+  sea-level: 62
+
+  # Generate trees on grass.
+  trees: true
+
+  # Biome id sent for every chunk (1 = plains).
+  biome: 1
+
+streaming:
+  # New chunks sent per movement packet while a player is streaming in.
+  chunks-per-tick: 4
+
+gameplay:
+  # Seconds without a continue-destroy-block packet before a block break is cancelled.
+  break-input-timeout: 0.5
+
+  # Send network block ids as an FNV-1a hash of the block state instead of a palette index.
+  use-block-hashes: true
+
+packets:
+  # Send the creative item list to joining players.
+  send-creative: true
+
+  # Send the actor id table. Needs real data files that are not shipped yet.
+  send-actor-ids: false
+
+  # Send biome_definitions.nbt. Needs a real file that is not shipped yet.
+  send-biome-defs: false
+
+debug:
+  # Log the hex of important packets, so start-up and login can be followed.
+  connection: false
+
+  # Log every packet id that passes through a session.
+  packets: false

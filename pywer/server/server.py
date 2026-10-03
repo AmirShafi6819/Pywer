@@ -56,9 +56,10 @@ MAX_CATCHUP_TICKS = 5
 class Server:
     SEND_TIMEOUT = 2.0
 
-    def __init__(self, port=config.PORT, bind="0.0.0.0"):
+    def __init__(self, port=config.PORT, bind=config.BIND):
         self.guid = random.getrandbits(63)
         self.port = port
+        self.bind = bind
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
             self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
@@ -175,7 +176,7 @@ class Server:
             % (config.GAME_VERSION, config.PROTOCOL, self.port, config.SEED),
             flush=True,
         )
-        log("Server", "Listening on 0.0.0.0:%d" % self.port)
+        log("Server", "Listening on %s:%d" % (self.bind, self.port))
         log("World", self.world_note)
 
     def unconnected(self, data, addr):
