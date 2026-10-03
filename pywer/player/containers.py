@@ -23,6 +23,8 @@ ARMOR_HEAD, ARMOR_CHEST, ARMOR_LEGS, ARMOR_FEET = 0, 1, 2, 3
 # UIInventorySlotOffset (values extracted from PlayerUISlot in Bedrock)
 UI_CURSOR = 0
 UI_CRAFTING2X2 = {28: 0, 29: 1, 30: 2, 31: 3}
+UI_CRAFTING3X3 = {32 + i: i for i in range(9)}
+UI_CREATED_OUTPUT_SLOT = 50
 
 CONTAINER_SIZES = {
     CONTAINER_INVENTORY: 36,
@@ -66,6 +68,8 @@ class ContainerRegistry:
         self.complex = {
             "cursor": ComplexContainer({UI_CURSOR: 0}, 1),
             "crafting2x2": ComplexContainer(UI_CRAFTING2X2, 4),
+            "crafting3x3": ComplexContainer(UI_CRAFTING3X3, 9),
+            "created_output": ComplexContainer({UI_CREATED_OUTPUT_SLOT: 0}, 1),
         }
         self._by_net_slot = {}
         for entry in self.complex.values():
