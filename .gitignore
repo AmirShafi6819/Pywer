@@ -2,4 +2,5 @@ reference/
 __pycache__/
 *.pyc
 world_data/
+plugins/data/
 pywer.txt

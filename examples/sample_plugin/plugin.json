@@ -1,0 +1,9 @@
+{
+  "name": "SamplePlugin",
+  "version": "1.0.0",
+  "main": "main:SamplePlugin",
+  "api_version": "1.0.0",
+  "author": "Antigravity Team",
+  "description": "Demonstration plugin showing Pywer 6-priority event bus, custom commands, scheduler, and virtual in-memory loading.",
+  "website": "https://github.com/EXBYPIXEL/Pywer"
+}

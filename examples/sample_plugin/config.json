@@ -1,0 +1,5 @@
+{
+  "join_message": "Welcome to the Pywer server, {player}!",
+  "motd": "Pywer Bedrock Server - Powered by pure Python",
+  "auto_heal": true
+}
