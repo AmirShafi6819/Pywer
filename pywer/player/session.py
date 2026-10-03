@@ -70,6 +70,7 @@ from ..protocol.inventory import (
     UI_ARMOR,
     UI_COMBINED,
     UI_CRAFTING_INPUT,
+    UI_CREATED_OUTPUT,
     UI_CURSOR,
     UI_HOTBAR,
     UI_INVENTORY,
@@ -175,6 +176,7 @@ from .containers import (
     CONTAINER_OFFHAND,
     CONTAINER_UI,
     ContainerRegistry,
+    UI_CREATED_OUTPUT_SLOT,
 )
 from .inventory import ITEM_AIR, item_tuple
 from .inventory_manager import ACTION_MINE_BLOCK, InventoryError, InventoryManager
@@ -515,7 +517,10 @@ class Session:
         Handles plain containers, the UI container ids that mirror the main inventory, and the
         shared UI slot space (ContainerIds::UI) used by the cursor and the crafting grid.
         """
+        orig_cid = cid
         cid = self.canonical_container(cid)
+        if orig_cid == UI_CREATED_OUTPUT and slot == 0:
+            slot = UI_CREATED_OUTPUT_SLOT
         if cid == CONTAINER_UI:
             hit = self.containers.complex_for_slot(slot)
             if hit is None:

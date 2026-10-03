@@ -64,8 +64,8 @@ class PredictionTracker:
         A negative client id refers to a past *request*; anything else is a server stack id.
         """
         info = self.info(container_id, slot)
-        if info is None:
-            return False
+        if info is None or info.stack_id == 0:
+            return client_stack_id <= 0
         if client_stack_id < 0:
             return info.request_id == client_stack_id
         return info.stack_id == client_stack_id
