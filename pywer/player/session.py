@@ -207,6 +207,10 @@ BLOCK_ACTION_NAMES = {
 BREAK_INPUT_TIMEOUT = config.BREAK_INPUT_TIMEOUT
 
 
+def _build_chunk_job(cx, cz):
+    return (cx, cz, build_chunk(cx, cz))
+
+
 class Session:
     RESEND_AFTER = 1.0
 
@@ -242,6 +246,8 @@ class Session:
         self.head_yaw = 0.0
         self.sent_chunks = set()
         self.chunk_queue = []
+        self.chunk_send_queue = []
+        self.chunks_in_flight = set()
         self.center = None
         self.radius = 0
         self.sneaking = False
@@ -775,6 +781,7 @@ class Session:
         if self.spawned:
             self.process_movement(now)
             self.tick_break(now)
+            self.stream_chunks()
             # InventoryManager::flushPendingUpdates - the corrections collected while handling
             # requests/transactions are only actually sent once per tick.
             self.predictions.flush()
@@ -1037,14 +1044,7 @@ class Session:
             self.center = (SPAWN[0] >> 4, SPAWN[2] >> 4)
             self.send_publisher(SPAWN)
             self.queue_chunks()
-            batch = self.chunk_queue[: (2 * rad + 1) ** 2]
-            self.chunk_queue = self.chunk_queue[len(batch) :]
-            for i in range(0, len(batch), 9):  # small batches (like PocketMine), not one 200 KB blob
-                self.send_packets(
-                    [self._pk(PID_CHUNK, build_chunk(x, z)) for x, z in batch[i : i + 9]]
-                )
-            self.sent_chunks.update(batch)
-            log("World", "Terrain chunks sent (%d)" % len(batch))
+            self.stream_chunks()
             self.play_status(3)
             log("Player", "PlayStatus(PLAYER_SPAWN) sent, waiting for SetLocalPlayerAsInitialized")
         elif pid == PID_INITIALIZED:
@@ -2041,6 +2041,15 @@ class Session:
         w.write_varuint32(self.radius * 16).write_u32_le(0)
         self.send_packet(PID_PUBLISHER, w.get())
 
+    def on_chunk_ready(self, cx, cz, payload):
+        """Callback from background worker when a chunk is built."""
+        self.chunks_in_flight.discard((cx, cz))
+        if self.center is not None:
+            dist_sq = (cx - self.center[0]) ** 2 + (cz - self.center[1]) ** 2
+            if dist_sq > (self.radius + 2) ** 2:
+                return
+        self.chunk_send_queue.append((cx, cz, payload))
+
     def queue_chunks(self):
         cx, cz = self.center
         r = self.radius
@@ -2048,14 +2057,34 @@ class Session:
             (x, z)
             for x in range(cx - r, cx + r + 1)
             for z in range(cz - r, cz + r + 1)
-            if (x, z) not in self.sent_chunks
+            if (x, z) not in self.sent_chunks and (x, z) not in self.chunks_in_flight
         ]
         self.chunk_queue = sorted(
             want, key=lambda c: (c[0] - cx) ** 2 + (c[1] - cz) ** 2
         )
+        cache = getattr(self.srv, "chunk_cache", None)
+        worker_pool = getattr(self.srv, "worker_pool", None)
+        to_remove = []
+        for x, z in self.chunk_queue:
+            cached = cache.get(x, z) if cache else None
+            if cached is not None:
+                self.chunk_send_queue.append((x, z, cached))
+                to_remove.append((x, z))
+            elif worker_pool:
+                self.chunks_in_flight.add((x, z))
+                worker_pool.submit("CHUNK", self.rid, _build_chunk_job, x, z)
+                to_remove.append((x, z))
+            else:
+                payload = build_chunk(x, z)
+                if cache:
+                    cache.put(x, z, payload)
+                self.chunk_send_queue.append((x, z, payload))
+                to_remove.append((x, z))
+        for item in to_remove:
+            self.chunk_queue.remove(item)
 
     def stream_chunks(self):
-        """Called on every movement packet: follow the player and send a few missing chunks per call."""
+        """Send ready-to-send chunks and monitor position for new chunk loads."""
         c = (math.floor(self.pos[0]) >> 4, math.floor(self.pos[2]) >> 4)
         if c != self.center:
             self.center = c
@@ -2067,13 +2096,13 @@ class Session:
                 for z in range(c[1] - self.radius - 2, c[1] + self.radius + 3)
             }
             self.sent_chunks &= keep  # chunks far away are forgotten by the client
-        if self.chunk_queue:
-            batch = self.chunk_queue[: config.CHUNKS_PER_TICK]
-            self.chunk_queue = self.chunk_queue[config.CHUNKS_PER_TICK :]
+        if self.chunk_send_queue:
+            batch = self.chunk_send_queue[: config.CHUNKS_PER_TICK]
+            self.chunk_send_queue = self.chunk_send_queue[config.CHUNKS_PER_TICK :]
             self.send_packets(
-                [self._pk(PID_CHUNK, build_chunk(x, z)) for x, z in batch]
+                [self._pk(PID_CHUNK, payload) for _x, _z, payload in batch]
             )
-            self.sent_chunks.update(batch)
+            self.sent_chunks.update((x, z) for x, z, _ in batch)
 
     def chat_to(self, msg):
         self.send_packets([self._pk(PID_TEXT, build_text(0, "", msg))])
