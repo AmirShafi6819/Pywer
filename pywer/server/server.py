@@ -46,6 +46,7 @@ from .worker import WorkerPool
 from ..entity.manager import EntityManager
 from ..world.cache import ChunkCache
 from ..scheduler import ServerScheduler
+from ..command import CommandManager, CommandSender, PlayerCommandSender, ConsoleCommandSender
 
 TICK_INTERVAL = 0.05
 MAX_CATCHUP_TICKS = 5
@@ -78,6 +79,10 @@ class Server:
         self.worker_pool = WorkerPool()
         self.chunk_cache = ChunkCache()
         self.scheduler = ServerScheduler(self)
+        self.event_mgr = events
+        self.event_manager = self.event_mgr
+        self.command_mgr = CommandManager(self)
+        self.command_manager = self.command_mgr
         self._next_tick = time.perf_counter() + TICK_INTERVAL
         self.load_world()
         self.motd = "MCPE;pywer-v0.9.1dev;%d;%s;0;1;%d;Minimal;Creative;1;%d;%d;" % (
@@ -344,67 +349,8 @@ class Server:
         return None
 
     def command(self, p, line):
-        a = line.split()
-        try:
-            if a and a[0] == "blocks":
-                p.chat_to("blocks: " + ", ".join(BLOCK_KEYS[1:]))
-            elif a and a[0] == "items":
-                p.chat_to(
-                    "items: " + ", ".join(sorted(k for k in ITEM_RUNTIME if k not in ("air", "water", "bedrock")))
-                )
-            elif a and a[0] == "tools":
-                self.give_tools(p)
-            elif a and a[0] == "give" and len(a) >= 2:
-                self.give(
-                    p,
-                    a[1],
-                    int(a[2]) if len(a) > 2 else 1,
-                    int(a[3]) if len(a) > 3 else None,
-                )
-            elif a and a[0] == "inv":
-                p.chat_to(
-                    "inv: "
-                    + " ".join(
-                        "%d:%s x%d" % (i, ITEM_NAME.get(s[0], s[0]), s[1])
-                        for i, s in enumerate(p.inventory)
-                        if s[1]
-                    )
-                )
-            elif a and a[0] == "setblock" and len(a) == 5:
-
-                def co(v, cur):
-                    return math.floor(cur) + int(v[1:] or 0) if v.startswith("~") else int(v)
-
-                x, y, z = (
-                    co(a[1], p.pos[0]),
-                    co(a[2], p.pos[1] - 1.62),
-                    co(a[3], p.pos[2]),
-                )
-                ok = self.set_block(x, y, z, a[4])
-                p.chat_to("setblock %d %d %d %s %s" % (x, y, z, a[4], "ok" if ok else "out of range"))
-            elif a and a[0] == "pos":
-                f = p.feet()
-                p.chat_to(
-                    "pos %.2f %.2f %.2f yaw %.1f pitch %.1f ground=%s fall=%.1f"
-                    % (f + (p.yaw, p.pitch, p.on_ground, p.fall_distance))
-                )
-            elif a and a[0] == "tp" and len(a) == 4:
-                f = p.feet()
-                t = [
-                    (f[i] + float(v[1:] or 0)) if v.startswith("~") else float(v)
-                    for i, v in enumerate(a[1:4])
-                ]
-                p.teleport(*t)
-                p.chat_to("teleported to %.1f %.1f %.1f" % tuple(t))
-            else:
-                p.chat_to(
-                    "!blocks | !items | !tools | !give <item> [n] [slot] | !inv | "
-                    "!setblock <x|~> <y|~> <z|~> <block> | !tp <x|~> <y|~> <z|~> | !pos"
-                )
-        except KeyError:
-            p.chat_to("unknown block (see !blocks)")
-        except ValueError:
-            p.chat_to("bad coordinates")
+        sender = PlayerCommandSender(p) if not isinstance(p, CommandSender) else p
+        return self.command_mgr.dispatch(sender, line)
 
     def on_join(self, p):
         others = self.playing(exclude=p)

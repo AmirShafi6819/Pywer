@@ -39,11 +39,19 @@ class PlayerChatEvent(Cancellable, PlayerEvent):
 
 
 class PlayerCommandPreprocessEvent(Cancellable, PlayerEvent):
-    """Fired before a command string starting with '/' is executed."""
+    """Fired before a command string starting with '/' or '!' is executed."""
 
     def __init__(self, player: Any, message: str) -> None:
         super().__init__(player)
         self.message = message
+
+    @property
+    def command(self) -> str:
+        return self.message
+
+    @command.setter
+    def command(self, val: str) -> None:
+        self.message = val
 
 
 class PlayerMoveEvent(Cancellable, PlayerEvent):

@@ -12,7 +12,12 @@ from .. import config
 from ..crypto.bedrock import BedrockCipher
 from ..crypto.ec import ecdh, pub_to_spki, spki_to_pub
 from ..crypto.jwt import jwt_make_es384
-from ..event import BlockBreakEvent, BlockPlaceEvent, PlayerChatEvent
+from ..event import (
+    BlockBreakEvent,
+    BlockPlaceEvent,
+    PlayerChatEvent,
+    PlayerCommandPreprocessEvent,
+)
 from ..event import manager as events
 from ..log import dbg, log
 from ..net.raknet import enc_addr
@@ -1135,8 +1140,11 @@ class Session:
             if ttype == 1:
                 r.read_string()
                 msg = sanitize_chat(r.read_string())
-                if msg.startswith("!") and self.spawned:
-                    self.srv.command(self, msg[1:])
+                if (msg.startswith("!") or msg.startswith("/")) and self.spawned:
+                    ev_cmd = events.call(PlayerCommandPreprocessEvent(self, msg))
+                    if ev_cmd.is_cancelled:
+                        return
+                    self.srv.command(self, ev_cmd.command)
                     return
                 if msg and self.spawned:
                     ev = events.call(PlayerChatEvent(self, msg))
