@@ -40,7 +40,9 @@ class ByteReader:
         v = self.read_varuint64(); return (v >> 1) ^ -(v & 1)
     def read_string(self): return self.read_bytes(self.read_varuint32()).decode("utf-8", "replace")
     def read_uuid(self):
-        b = self.read_bytes(16); return uuid.UUID(bytes=b[8:][::-1] + b[:8][::-1])  # Bedrock: two LE u64
+        b = self.read_bytes(16)
+        return uuid.UUID(bytes=b[:8][::-1] + b[8:][::-1])  # Bedrock: two LE u64
+
     def rest(self): return self.read_bytes(self.left())
 
 class ByteWriter:
