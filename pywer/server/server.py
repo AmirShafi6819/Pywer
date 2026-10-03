@@ -43,6 +43,7 @@ from ..player.movement import NETWORK_EYE_OFFSET
 from ..player.session import Session
 from ..event import manager as events, PlayerJoinEvent, PlayerQuitEvent
 from .worker import WorkerPool
+from ..entity.manager import EntityManager
 from ..world.cache import ChunkCache
 
 TICK_INTERVAL = 0.05
@@ -65,7 +66,8 @@ class Server:
         self.sessions = {}
         self.key = ec_keygen()
         self.next_rid = 1
-        self.item_entities = {}
+        self.entity_mgr = EntityManager(self)
+        self.item_entities = self.entity_mgr.entities
         self._last_tick = 0.0
         self.world_storage = WorldStorage()
         self.player_storage = PlayerStorage()
@@ -258,79 +260,15 @@ class Server:
         return True
 
     def drop_item(self, pos, item_key, count=1, motion=None, now=None):
-        now = time.time() if now is None else now
-        if item_key not in ITEM_RUNTIME:
-            return False
-        count = int(count)
-        if count <= 0:
-            return False
-        px, py, pz = float(pos[0]), float(pos[1]), float(pos[2])
-        for e in self.item_entities.values():
-            if e["key"] != item_key:
-                continue
-            ex, ey, ez = e["pos"]
-            if (ex - px) ** 2 + (ey - py) ** 2 + (ez - pz) ** 2 <= ie.MERGE_RANGE**2:
-                e["count"] += count
-                e["age"] = 0.0
-                e["spawned_at"] = now
-                e["pickup_at"] = now + ie.PICKUP_DELAY
-                return True
-        motion = motion or (random.random() * 0.2 - 0.1, 0.2, random.random() * 0.2 - 0.1)
-        eid = self.next_rid
-        self.next_rid += 1
-        self.item_entities[eid] = {
-            "key": item_key,
-            "count": count,
-            "pos": (px, py, pz),
-            "motion": tuple(float(v) for v in motion),
-            "age": 0.0,
-            "spawned_at": now,
-            "pickup_delay": ie.PICKUP_DELAY,
-            "pickup_at": now + ie.PICKUP_DELAY,
-        }
-        pkt = Session._pk(PID_ADD_ITEM_ACTOR, build_add_item_actor(eid, item_key, count, (px, py, pz), motion))
-        self.broadcast([pkt])
-        return True
+        return self.entity_mgr.drop_item(pos, item_key, count=count, motion=motion, now=now)
 
     def remove_item_entity(self, eid):
         """Despawn an item entity and tell every client to drop it."""
-        e = self.item_entities.pop(eid, None)
-        if e is None:
-            return False
-        self.broadcast([Session._pk(PID_REMOVE_ACTOR, ByteWriter().write_varint64(eid).get())])
-        return True
+        return self.entity_mgr.remove(eid) is not None
 
     def tick_item_entities(self, now, dt):
-        """Gravity, movement, pickup and despawn for every dropped item."""
-        if not self.item_entities:
-            return
-        for eid in list(self.item_entities.keys()):
-            e = self.item_entities.get(eid)
-            if e is None:
-                continue
-            e["age"] = now - e.get("spawned_at", now)
-            if e["age"] >= ie.LIFETIME:
-                self.remove_item_entity(eid)
-                continue
-            if ie.step_item(e, is_solid):
-                self.broadcast([Session._pk(PID_MOVE_ACTOR_ABSOLUTE, build_move_entity(eid, e["pos"]))])
-            for p in self.playing():
-                if not ie.can_pickup(e, p.feet(), now, is_solid):
-                    continue
-                item_id = ITEM_RUNTIME.get(e["key"])
-                if item_id is None:
-                    break
-                if first_empty_slot(p.inventory) is None:
-                    continue
-                left = add_item(p.inventory, item_tuple(item_id, e["count"], 0))
-                if left > 0:
-                    continue
-                taken = e["count"]
-                e["count"] = 0
-                p.sync_inventory()
-                self.remove_item_entity(eid)
-                log("World", "%s picked up %d %s" % (p.name, taken, e["key"]))
-                break
+        """Tick all entities through EntityManager."""
+        self.entity_mgr.tick(now, dt, is_solid)
 
     def set_block(self, x, y, z, key):
         """Change one block for everybody (also stored, so later chunk loads see it)."""

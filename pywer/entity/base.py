@@ -32,6 +32,10 @@ class Entity:
     def chunk(self):
         return (int(self.pos[0]) >> 4, int(self.pos[2]) >> 4)
 
+    def feet(self):
+        """Feet/base position for actor packets."""
+        return self.pos
+
     def aabb(self):
         """Bounding box: (min_x, min_y, min_z, max_x, max_y, max_z)."""
         hw = self.width / 2.0

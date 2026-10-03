@@ -32,22 +32,45 @@ class Projectile(Entity):
         self.in_ground = True
         self.motion = (0.0, 0.0, 0.0)
 
+    def on_hit_block(self, target_or_block, hit_pos):
+        self.pos = hit_pos
+
+    def on_hit_entity(self, target, hit_pos):
+        self.pos = hit_pos
+        if hasattr(target, "damage"):
+            target.damage(self.damage, source_rid=self.shooter_rid)
+        self.dead = True
+
     def tick(self, now, dt, world_is_solid):
+        self.age += dt
         if self.in_ground:
             self.life_ticks += 1
             if self.life_ticks >= 1200:  # 60 seconds
                 self.dead = True
             return False
 
+        # Collision query along trajectory
+        nearby = []
+        if hasattr(self.srv, "entity_mgr") and hasattr(self.srv.entity_mgr, "entities_near"):
+            nearby = self.srv.entity_mgr.entities_near(self.pos, radius=4.0)
+
+        from .physics import check_projectile_collisions
+        hit_type, target_or_block, hit_pos = check_projectile_collisions(self, nearby, world_is_solid)
+
+        if hit_type == "block":
+            self.on_hit_block(target_or_block, hit_pos)
+            return True
+        elif hit_type == "entity":
+            self.on_hit_entity(target_or_block, hit_pos)
+            return True
+
+        # In-flight aerodynamics: apply gravity and drag
         vx, vy, vz = self.motion
         vy -= self.gravity
         vx *= (1.0 - self.drag)
         vz *= (1.0 - self.drag)
         self.motion = (vx, vy, vz)
-
-        x, y, z = self.pos
-        nx, ny, nz = x + vx, y + vy, z + vz
-        self.pos = (nx, ny, nz)
+        self.pos = hit_pos
 
         # Update look orientation from velocity vector
         horiz_speed = math.hypot(vx, vz)
@@ -86,6 +109,10 @@ class Arrow(Projectile):
         self.width = 0.25
         self.height = 0.25
 
+    def on_hit_block(self, target_or_block, hit_pos):
+        self.pos = hit_pos
+        self.stick_in_ground()
+
 
 class Snowball(Projectile):
     """Thrown snowball entity."""
@@ -112,3 +139,7 @@ class Snowball(Projectile):
         self.identifier = "minecraft:snowball"
         self.width = 0.25
         self.height = 0.25
+
+    def on_hit_block(self, target_or_block, hit_pos):
+        self.pos = hit_pos
+        self.dead = True
