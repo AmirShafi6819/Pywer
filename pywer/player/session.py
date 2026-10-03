@@ -288,6 +288,8 @@ class Session:
         self.spawned = False
         self.name = "Player"
         self.uuid = uuid.uuid4()
+        self.xuid = ""
+        self.real_ip = None
         self.client_data = {}
         self.skin_bytes = b""
         self.seen_unknown = set()
@@ -942,6 +944,13 @@ class Session:
                 )
                 return
             info["uuid"] = uuid.uuid5(uuid.NAMESPACE_DNS, "offline:" + info["name"])
+            self.xuid = info.get("proxy_xuid") or info.get("xuid") or ""
+            self.real_ip = info.get("proxy_ip") if config.PROXY_MODE else None
+            if config.PROXY_MODE:
+                log(
+                    "Login",
+                    "via proxy: real ip=%s xuid=%s" % (self.real_ip or "?", self.xuid or "?"),
+                )
             self.name = info["name"]
             self.uuid = info["uuid"]
             self.client_data = info["client_data"] or {}
@@ -951,7 +960,10 @@ class Session:
                 "Offline login accepted: %s (uuid %s)"
                 % (info["name"], info["uuid"]),
             )
-            if config.ENCRYPTION:
+            use_enc = config.ENCRYPTION
+            if config.PROXY_MODE and config.PROXY_ENCRYPTION is not None:
+                use_enc = config.PROXY_ENCRYPTION
+            if use_enc:
                 self.state = "ENCRYPTION_HANDSHAKE"
                 client_pub = spki_to_pub(
                     base64.b64decode(info["client_key"] or info["identity_key"])

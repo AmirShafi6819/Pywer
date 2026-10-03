@@ -1,13 +1,39 @@
+import argparse
+import os
 import signal
-import sys
 from .. import config
 from .server import Server
 
 
+def _env_bool(name):
+    v = os.environ.get(name)
+    if v is None:
+        return None
+    return v.strip().lower() in ("1", "true", "yes", "on")
+
+
 def main():
-    port = int(sys.argv[1]) if len(sys.argv) > 1 else config.PORT
-    srv = Server(port)
+    ap = argparse.ArgumentParser(prog="pywer")
+    ap.add_argument("port", nargs="?", type=int, default=config.PORT, help="UDP port (default %d)" % config.PORT)
+    ap.add_argument("--bind", default=os.environ.get("PYWER_BIND", "0.0.0.0"), help="address to bind (default 0.0.0.0)")
+    ap.add_argument("--proxy", action="store_true", help="run behind WaterdogPE (reads Waterdog_IP/Waterdog_XUID)")
+    ap.add_argument("--no-encryption", action="store_true", help="disable packet encryption (proxy mode only)")
+    args = ap.parse_args()
+
+    env_proxy = _env_bool("PYWER_PROXY")
+    config.PROXY_MODE = bool(args.proxy or env_proxy)
+    env_enc = _env_bool("PYWER_ENCRYPTION")
+    if config.PROXY_MODE:
+        if args.no_encryption:
+            config.PROXY_ENCRYPTION = False
+        elif env_enc is not None:
+            config.PROXY_ENCRYPTION = env_enc
+
+    srv = Server(args.port, bind=args.bind)
     srv.banner()
+    if config.PROXY_MODE:
+        print("Proxy mode: ON (WaterdogPE) | encryption: %s" % (
+            "off" if config.PROXY_ENCRYPTION is False else "on" if config.ENCRYPTION else "off"), flush=True)
 
     # Save on SIGTERM too, so `kill` and service managers persist the world like Ctrl+C does.
     def _terminate(_signum, _frame):

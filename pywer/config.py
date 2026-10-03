@@ -8,6 +8,13 @@ PROTOCOL = 766
 GAME_VERSION = "1.21.50"
 SERVER_TITLE = "§epywer-v0.9.1dev"
 ENCRYPTION = True
+# ---- proxy (WaterdogPE) support
+# PROXY_MODE: the server sits behind a proxy such as WaterdogPE. The proxy already authenticated the
+# player, so the login chain is never verified (Pywer is always offline) and the extra fields the
+# proxy adds to the client data (Waterdog_IP / Waterdog_XUID) are read. Set via `--proxy` or PYWER_PROXY=1.
+PROXY_MODE = False
+# Encryption between proxy and server is optional (same machine / private network); None = keep ENCRYPTION.
+PROXY_ENCRYPTION = None
 COMPRESSION_THRESHOLD = 256
 DEFAULT_SPAWN = (0, 100, 0)
 GAMEMODE = 0                 # 0 survival, 1 creative

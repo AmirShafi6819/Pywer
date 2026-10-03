@@ -82,6 +82,27 @@ The server binds to `0.0.0.0:19132` (UDP) by default and is immediately ready to
 
 ---
 
+## 🐕 Running behind WaterdogPE
+
+```
+python -m pywer 19133 --proxy --bind 127.0.0.1 --no-encryption
+```
+
+WaterdogPE `config.yml` (key names may vary slightly between versions):
+
+```yaml
+servers:
+  pywer:
+    address: 127.0.0.1:19133
+online_mode: true        # Xbox auth happens on the proxy
+use_login_extras: true   # Pywer reads Waterdog_IP / Waterdog_XUID (false also works)
+```
+
+Pywer is always offline (it never verifies the login chain), so no `xbox-auth` switch is needed.
+Players must use protocol 766 (1.21.50). Env vars: `PYWER_PROXY=1`, `PYWER_BIND`, `PYWER_ENCRYPTION=0`.
+
+---
+
 ## 🧩 Plugin Development Guide
 
 Pywer features an API designed for ease of use, strict typing, and high performance.

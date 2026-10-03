@@ -55,5 +55,10 @@ def parse_login(body):
     except Exception as e:
         log("Login", "clientData JWT parse failed: %r" % e)
 
+    cd = info["client_data"] if isinstance(info["client_data"], dict) else {}
+    # Fields added by WaterdogPE when use_login_extras is on.
+    info["proxy_ip"] = cd.get("Waterdog_IP") or None
+    info["proxy_xuid"] = cd.get("Waterdog_XUID") or None
+
     info["name"] = sanitize_name(info["name"])
     return info
