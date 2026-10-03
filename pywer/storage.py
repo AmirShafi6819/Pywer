@@ -1,29 +1,33 @@
 # ---------------------------------------------------------------- world / player persistence
-# Plain JSON on disk: no third-party dependency, human-inspectable, and cheap because only
-# dirty chunks are rewritten.
-import json, os, time
+"""World level and player state persistence (plain JSON on disk)."""
+
+import json
+import os
+import time
 
 DATA_DIR = "world_data"
 WORLD_FILE = "level.json"
 PLAYER_FILE = "players.json"
-SAVE_INTERVAL = 30.0        # seconds between autosaves
+SAVE_INTERVAL = 30.0  # seconds between autosaves
+
 
 def data_dir(base=None):
     path = base or DATA_DIR
     os.makedirs(path, exist_ok=True)
     return path
 
-class WorldStorage:
-    """Persists the seed, world metadata and every block the players changed.
 
-    Chunks are tracked individually so a single block edit only rewrites that chunk on the
-    next save instead of the whole world.
+class WorldStorage:
+    """Persists seed, world metadata, and modified chunk blocks.
+
+    Chunks are tracked individually so a single block edit only rewrites that chunk on next save.
     """
+
     def __init__(self, base=None):
         self.dir = data_dir(base)
         self.path = os.path.join(self.dir, WORLD_FILE)
         self.meta = {}
-        self.chunks = {}            # "cx,cz" -> {"seed": n, "edits": {"lx,y,lz": key}}
+        self.chunks = {}  # "cx,cz" -> {"seed": n, "edits": {"lx,y,lz": key}}
         self.dirty = set()
         self.loaded = False
 
@@ -56,7 +60,8 @@ class WorldStorage:
 
     def save(self, meta=None, edits=None):
         """Write the level. Only chunks in `dirty` are re-serialised."""
-        if meta: self.meta.update(meta)
+        if meta:
+            self.meta.update(meta)
         if edits is not None:
             # Rebuild the chunk index from the current edit map, preserving untouched entries.
             previous = self.chunks
@@ -71,12 +76,11 @@ class WorldStorage:
                 cx, cz = key.split(",")
                 if (int(cx), int(cz)) in self.dirty:
                     self.chunks[key]["touched"] = int(time.time())
-        payload = {"meta": self.meta, "chunks": self.chunks,
-                   "saved_at": int(time.time())}
+        payload = {"meta": self.meta, "chunks": self.chunks, "saved_at": int(time.time())}
         tmp = self.path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(payload, fh, separators=(",", ":"))
-        os.replace(tmp, self.path)          # atomic: a crash mid-save cannot corrupt the level
+        os.replace(tmp, self.path)  # atomic: a crash mid-save cannot corrupt the level
         self.dirty.clear()
         return True
 
@@ -95,6 +99,7 @@ class WorldStorage:
 
 class PlayerStorage:
     """Player data keyed by UUID, so reconnecting restores the same character."""
+
     def __init__(self, base=None):
         self.dir = data_dir(base)
         self.path = os.path.join(self.dir, PLAYER_FILE)
@@ -102,7 +107,8 @@ class PlayerStorage:
         self.dirty = set()
 
     def load(self):
-        if not os.path.exists(self.path): return False
+        if not os.path.exists(self.path):
+            return False
         try:
             with open(self.path, "r", encoding="utf-8") as fh:
                 self.players = json.load(fh)
@@ -119,7 +125,8 @@ class PlayerStorage:
         self.dirty.add(str(uuid))
 
     def save(self, force=False):
-        if not self.dirty and not force: return False
+        if not self.dirty and not force:
+            return False
         tmp = self.path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(self.players, fh, separators=(",", ":"))
