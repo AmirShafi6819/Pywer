@@ -18,7 +18,7 @@ TERRAIN = True              # False = old behaviour (empty world, spawn 0,100,0)
 USE_BLOCK_HASHES = True      # network block ids = FNV-1a hash of the block state (see the world blocks module)
 SEND_ACTOR_IDS = False       # needs real data files (not in the PocketMine zip); try True later
 SEND_BIOME_DEFS = False      # needs real biome_definitions.nbt; try True later
-SEND_CREATIVE = False        # needs real creative items; try True later
+SEND_CREATIVE = True        # needs real creative items; try True later
 
 # ---- world generation
 MIN_Y, MAX_Y = -64, 319      # overworld height range of 1.21.50 (sub chunks -4..19)

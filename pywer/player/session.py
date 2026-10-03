@@ -17,8 +17,7 @@ from ..protocol.packet_ids import (PID_ACTOR_IDS, PID_ANIMATE, PID_AUTH_INPUT, P
                                    PID_S2C_HANDSHAKE, PID_SET_ACTOR_DATA, PID_SET_ACTOR_MOTION, PID_SET_TIME, PID_ACTOR_EVENT,
                                    PID_START_GAME, PID_TEXT, PID_UPDATE_ATTRIBUTES, PID_NETWORK_SETTINGS, PID_PLAY_SOUND,
                                    PID_PLAYER_ACTION, PID_UPDATE_ABILITIES, PID_PLAYER_HOTBAR,
-                                   PID_LEVEL_SOUND_EVENT, SOUND_HIT, PID_INTERACT,
-                                   PID_CONTAINER_OPEN, PID_CONTAINER_CLOSE, PID_UPDATE_ADVENTURE_SETTINGS,
+                                   PID_LEVEL_SOUND_EVENT, SOUND_HIT, PID_INTERACT, PID_CRAFTING_DATA,                                   PID_CONTAINER_OPEN, PID_CONTAINER_CLOSE, PID_UPDATE_ADVENTURE_SETTINGS,
                                    INTERACT_LEAVE_VEHICLE, INTERACT_MOUSEOVER, INTERACT_OPEN_INVENTORY,
                                    PLAY_FAILED_CLIENT, PLAY_FAILED_SERVER, PLAY_LOGIN_SUCCESS,
                                    LEVEL_EVENT_BLOCK_START_BREAK, LEVEL_EVENT_BLOCK_STOP_BREAK,
@@ -578,6 +577,7 @@ class Session:
                 if config.SEND_ACTOR_IDS: self.send_packet(PID_ACTOR_IDS, EMPTY_NBT)
                 if config.SEND_BIOME_DEFS: self.send_packet(PID_BIOME_DEFS, EMPTY_NBT)
                 if config.SEND_CREATIVE: self.send_packet(PID_CREATIVE, b"\x00")
+                self.send_packet(PID_CRAFTING_DATA, b"\x00\x00\x00\x00\x01")   # empty CraftingData
                 self.send_packet(PID_SET_TIME, ByteWriter().write_varint32(6000).get())
                 self.state = "WORLD_LOADING"; log("World", "Waiting for RequestChunkRadius")
             elif status == 1:

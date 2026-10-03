@@ -1,6 +1,8 @@
 # ---------------------------------------------------------------- inventory protocol (PocketMine 5.22 / BedrockProtocol 35.0.3 subset)
 # UI container IDs are taken directly from BedrockProtocol ContainerUIIds.
 from ..util.serializer import ByteReader, ByteWriter
+from .item_stack import EMPTY_ITEM_EXTRA
+from ..world.blocks import item_key_for_id, BLOCK_RUNTIME
 
 # ContainerUIIds (serverbound stack request container-interface ids)
 UI_ANVIL_INPUT = 0; UI_ANVIL_MATERIAL = 1
@@ -57,14 +59,14 @@ def item_stack_id(item):
     return 0 if item[1] <= 0 else ((item[0] * 257 + item[2]) & 0x7fffffff) or 1
 
 def build_inventory_stack(item, stack_id=0):
-    """ItemStackWrapper. stack_id is the server-assigned id the new inventory system uses to
-    reconcile the client's predictions; 0 means "no id" and is written as the empty case."""
     if item[1] <= 0: return b"\x00"
-    item_id,count,meta=item
-    w=ByteWriter(); w.write_varint32(item_id); w.write_u16_le(count); w.write_varuint32(meta)
+    item_id, count, meta = item
+    key = item_key_for_id(item_id)
+    block_rid = (BLOCK_RUNTIME.get(key, 0) if key not in (None, "air", "water") else 0) & 0xFFFFFFFF
+    w = ByteWriter(); w.write_varint32(item_id); w.write_u16_le(count); w.write_varuint32(meta)
     w.write_bool(stack_id != 0)
     if stack_id: w.write_varint32(stack_id)
-    w.write_varint32(0); w.write_string("")
+    w.write_varint32(block_rid); w.write_string(EMPTY_ITEM_EXTRA)
     return w.get()
 
 def build_full_container_name(container_id, dynamic_id=None):
