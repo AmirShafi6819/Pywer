@@ -41,12 +41,13 @@ from ..packets.spawn import build_add_player
 from ..packets.text import build_text
 from ..player.movement import NETWORK_EYE_OFFSET
 from ..player.session import Session
-from ..event import manager as events, PlayerJoinEvent, PlayerQuitEvent
+from ..event import manager as events, PlayerJoinEvent, PlayerQuitEvent, ServerLoadEvent, ServerStopEvent
 from .worker import WorkerPool
 from ..entity.manager import EntityManager
 from ..world.cache import ChunkCache
 from ..scheduler import ServerScheduler
 from ..command import CommandManager, CommandSender, PlayerCommandSender, ConsoleCommandSender
+from ..plugin import PluginManager
 
 TICK_INTERVAL = 0.05
 MAX_CATCHUP_TICKS = 5
@@ -83,6 +84,13 @@ class Server:
         self.event_manager = self.event_mgr
         self.command_mgr = CommandManager(self)
         self.command_manager = self.command_mgr
+        self.plugins_dir = Path("plugins")
+        self.plugin_data_dir = self.plugins_dir / "data"
+        self.plugin_mgr = PluginManager(self, self.plugins_dir, self.plugin_data_dir)
+        self.plugin_manager = self.plugin_mgr
+        self.plugin_mgr.load_all_plugins()
+        self.plugin_mgr.enable_all()
+        self.event_mgr.call(ServerLoadEvent())
         self._next_tick = time.perf_counter() + TICK_INTERVAL
         self.load_world()
         self.motd = "MCPE;pywer-v0.9.1dev;%d;%s;0;1;%d;Minimal;Creative;1;%d;%d;" % (
@@ -465,7 +473,13 @@ class Server:
             self.step()
 
     def stop(self):
-        """Cleanly shut down worker pool, save world, and close socket."""
+        """Cleanly shut down plugins, scheduler, worker pool, save world, and close socket."""
+        try:
+            self.event_mgr.call(ServerStopEvent())
+        except Exception:
+            pass
+        if hasattr(self, "plugin_mgr"):
+            self.plugin_mgr.disable_all()
         self.scheduler.shutdown()
         self.save_all(force=True)
         self.worker_pool.shutdown()

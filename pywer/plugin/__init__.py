@@ -7,6 +7,7 @@ and runtime APIs for Bedrock server plugins.
 from .base import PluginBase, PluginConfig, PluginLogger, PluginManifest
 from .compiler import PluginCompileError, PluginCompiler
 from .loader import PywerZipFinder, PywerZipLoader, VirtualPluginLoader
+from .manager import PluginManager
 
 __all__ = [
     "PluginBase",
@@ -18,4 +19,5 @@ __all__ = [
     "PywerZipFinder",
     "PywerZipLoader",
     "VirtualPluginLoader",
+    "PluginManager",
 ]
