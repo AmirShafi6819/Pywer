@@ -115,6 +115,7 @@ CONTAINER_ID_UI = 124
 WINDOW_NONE = -9
 WINDOW_INVENTORY = -1
 WINDOW_CONTAINER = 0
+WINDOW_WORKBENCH = 1
 
 
 def item_stack_id(item):
@@ -288,12 +289,12 @@ def parse_item_stack_request(body):
     return reqs
 
 
-def build_container_open(window_id, window_type, actor_rid):
+def build_container_open(window_id, window_type, actor_rid, pos=(0, 0, 0)):
     """ContainerOpenPacket: byte window id, byte window type, block position, actor unique id."""
     w = ByteWriter()
     w.write_u8(window_id & 0xFF)
     w.write_u8(window_type & 0xFF)
-    w.write_varint32(0).write_varuint32(0).write_varint32(0)  # position unused for entity inventories
+    w.write_varint32(pos[0]).write_varuint32(pos[1]).write_varint32(pos[2])
     # ContainerOpenPacket::encodePayload writes actor with signed (zigzag) varlong
     w.write_varint64(actor_rid)
     return w.get()

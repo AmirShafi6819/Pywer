@@ -25,7 +25,7 @@ from ..protocol.packet_ids import (
     PID_UPDATE_BLOCK,
 )
 from ..world.chunk import build_update_block
-from ..world.blocks import BLOCK_KEYS, BLOCK_RUNTIME, ITEM_RUNTIME, drops_for
+from ..world.blocks import BLOCK_KEYS, BLOCK_RUNTIME, ITEM_RUNTIME, drops_for, item_key_for_id
 from ..data.item_table import ITEM_TABLE
 
 ITEM_NAME = {rid: name.split(":")[-1] for name, rid, _ in ITEM_TABLE}
@@ -71,6 +71,7 @@ class Server:
         self.player_storage = PlayerStorage()
         self._last_save = time.time()
         self._window_id = CONTAINER_ID_FIRST
+        self.chests = {}
         self.worker_pool = WorkerPool()
         self.chunk_cache = ChunkCache()
         self._next_tick = time.perf_counter() + TICK_INTERVAL
@@ -245,6 +246,13 @@ class Server:
         elif p is None:
             for item_key, count in drops:
                 self.drop_item((x + 0.5, y + 1.0, z + 0.5), item_key, count)
+        if key == "chest" and (x, y, z) in self.chests:
+            chest_items = self.chests.pop((x, y, z))
+            for item in chest_items:
+                if item[0] != 0 and item[1] > 0:
+                    ikey = item_key_for_id(item[0])
+                    if ikey:
+                        self.drop_item((x + 0.5, y + 1.0, z + 0.5), ikey, item[1])
         if not drops:
             dbg("World", "no drops for %s at %d,%d,%d (tool %s)" % (key, x, y, z, held))
         return True

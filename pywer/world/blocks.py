@@ -41,6 +41,8 @@ register_block("bedrock", states={"infiniburn_bit": (T_BYTE, 0)})
 register_block("water", states={"liquid_depth": (T_INT, 0)})
 register_block("oak_log", states={"pillar_axis": (T_STR, "y")})
 register_block("oak_leaves", states={"persistent_bit": (T_BYTE, 0), "update_bit": (T_BYTE, 0)})
+register_block("crafting_table")
+register_block("chest", states={"facing_direction": (T_INT, 2)})
 
 # ---------------------------------------------------------------- tools
 # BlockToolType (PocketMine bit values)
@@ -65,6 +67,8 @@ BLOCK_TOOL = {
     "gravel": (TOOL_SHOVEL, 0),
     "oak_log": (TOOL_AXE, 0),
     "oak_planks": (TOOL_AXE, 0),
+    "crafting_table": (TOOL_AXE, 0),
+    "chest": (TOOL_AXE, 0),
     "oak_leaves": (TOOL_NONE, 0),
     "water": (TOOL_NONE, 0),
     "air": (TOOL_NONE, 0),
@@ -105,6 +109,8 @@ ITEM_RUNTIME = {
         "oak_leaves",
         "bedrock",
         "water",
+        "crafting_table",
+        "chest",
         "stick",
         "flint",
         "shears",
@@ -135,6 +141,8 @@ DROP_FOR_BLOCK = {
     "sandstone": [("sandstone", 1)],
     "oak_log": [("oak_log", 1)],
     "oak_planks": [("oak_planks", 1)],
+    "crafting_table": [("crafting_table", 1)],
+    "chest": [("chest", 1)],
 }
 
 # Vanilla secondary drops
@@ -153,6 +161,8 @@ BLOCK_SOUND = {
     "sandstone": ("dig.stone", "step.stone", "place.stone"),
     "oak_log": ("dig.wood", "step.wood", "place.wood"),
     "oak_planks": ("dig.wood", "step.wood", "place.wood"),
+    "crafting_table": ("dig.wood", "step.wood", "place.wood"),
+    "chest": ("dig.wood", "step.wood", "place.wood"),
     "oak_leaves": ("dig.grass", "step.grass", "place.grass"),
     "water": ("dig.water", "step.water", "place.water"),
     "air": ("dig.grass", "step.grass", "place.grass"),
@@ -176,11 +186,15 @@ BLOCK_HARDNESS = {
     "gravel": 0.6,
     "sandstone": 0.8,
     "oak_log": 2.0,
+    "oak_planks": 2.0,
+    "crafting_table": 2.5,
+    "chest": 2.5,
     "oak_leaves": 0.2,
     "bedrock": float("inf"),
     "water": float("inf"),
     "air": 0.0,
 }
+
 
 COMPATIBLE_TOOL_MULTIPLIER = 1.5
 INCOMPATIBLE_TOOL_MULTIPLIER = 5.0

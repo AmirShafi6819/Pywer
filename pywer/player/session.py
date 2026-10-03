@@ -76,7 +76,9 @@ from ..protocol.inventory import (
     UI_INVENTORY,
     UI_OFFHAND,
     UI_SPACE_IDS,
+    WINDOW_CONTAINER,
     WINDOW_INVENTORY,
+    WINDOW_WORKBENCH,
     build_container_close,
     build_container_open,
     build_inventory_content,
@@ -165,6 +167,7 @@ from ..world.blocks import (
     block_key_from_runtime,
     block_sound,
     break_seconds,
+    item_key_for_id,
     item_key_from_id,
 )
 from ..world.chunk import build_chunk
@@ -178,7 +181,7 @@ from .containers import (
     ContainerRegistry,
     UI_CREATED_OUTPUT_SLOT,
 )
-from .inventory import ITEM_AIR, item_tuple
+from .inventory import ITEM_AIR, add_item, item_tuple
 from .inventory_manager import ACTION_MINE_BLOCK, InventoryError, InventoryManager
 from .movement import (
     ALLOW_FLIGHT,
@@ -293,6 +296,8 @@ class Session:
         self.seen_break_rejects = set()
         self._pending_changed_slots = set()
         self.open_window = False
+        self.open_window_pos = None
+        self.open_window_type = None
         self.seen_item_use = set()
         self.seen_place_rejects = set()
         self.seen_slot_mappings = set()
@@ -527,6 +532,10 @@ class Session:
                 return None
             entry, core = hit
             return ("ui:%d" % slot, entry.items, core)
+        if self.open_window and self.open_window_type == WINDOW_CONTAINER and cid == self.open_window_id:
+            chest_items = self.srv.chests.get(self.open_window_pos)
+            if chest_items is not None and 0 <= slot < len(chest_items):
+                return (cid, chest_items, slot)
         cont = self.containers.get(cid)
         if cont is not None:
             if cid == CONTAINER_OFFHAND:
@@ -1554,6 +1563,13 @@ class Session:
             return self._reject_place(pos, "target y %d out of world height" % ny)
         if not self._block_reach_ok(pos):
             return self._reject_place(pos, "clicked block out of reach")
+        if not self.sneaking:
+            if clicked == "crafting_table":
+                self.open_crafting_table(pos)
+                return True
+            if clicked == "chest":
+                self.open_chest(pos)
+                return True
         key, source = self._held_block_key(tx)
         if key is None:
             return self._reject_place(
@@ -1720,21 +1736,72 @@ class Session:
             ),
         )
 
+    def open_crafting_table(self, pos):
+        """Open a 3x3 workbench window at pos."""
+        if self.open_window:
+            self.close_main_inventory(notify=False)
+        self.open_window = True
+        self.open_window_id = self.srv.next_window_id()
+        self.open_window_pos = pos
+        self.open_window_type = WINDOW_WORKBENCH
+        self.send_packet(
+            PID_CONTAINER_OPEN,
+            build_container_open(self.open_window_id, WINDOW_WORKBENCH, -1, pos),
+        )
+        self.window_to_container[self.open_window_id] = CONTAINER_INVENTORY
+        log("Inventory", "%s opened crafting table at %s (window %d)" % (self.name, pos, self.open_window_id))
+
+    def open_chest(self, pos):
+        """Open a 27-slot chest container window at pos."""
+        if self.open_window:
+            self.close_main_inventory(notify=False)
+        self.open_window = True
+        self.open_window_id = self.srv.next_window_id()
+        self.open_window_pos = pos
+        self.open_window_type = WINDOW_CONTAINER
+        chest_items = self.srv.chests.setdefault(pos, [ITEM_AIR] * 27)
+        self.send_packet(
+            PID_CONTAINER_OPEN,
+            build_container_open(self.open_window_id, WINDOW_CONTAINER, -1, pos),
+        )
+        self.window_to_container[self.open_window_id] = self.open_window_id
+        self.send_packet(
+            PID_INVENTORY_CONTENT,
+            build_inventory_content(self.open_window_id, chest_items, container_id=self.open_window_id),
+        )
+        log("Inventory", "%s opened chest at %s (window %d)" % (self.name, pos, self.open_window_id))
+
     def close_main_inventory(self, notify=True):
         if not self.open_window:
             return
         window = self.open_window_id or self.inventory_window_id
+        wtype = self.open_window_type or WINDOW_INVENTORY
+        if self.open_window_type == WINDOW_WORKBENCH:
+            c3 = self.containers.complex.get("crafting3x3")
+            if c3:
+                for i in range(len(c3.items)):
+                    it = c3.items[i]
+                    if it[0] != 0 and it[1] > 0:
+                        leftover = add_item(self.inventory, it)
+                        if leftover > 0:
+                            ikey = item_key_for_id(it[0])
+                            if ikey:
+                                self.srv.drop_item(self.feet(), ikey, leftover)
+                        c3.items[i] = ITEM_AIR
+                self.sync_inventory()
         self.open_window = False
         self.open_window_id = 0
+        self.open_window_pos = None
+        self.open_window_type = None
         self.window_to_container.pop(window, None)
         if notify:
             self.send_packet(
                 PID_CONTAINER_CLOSE,
-                build_container_close(window, WINDOW_INVENTORY, True),
+                build_container_close(window, wtype, True),
             )
             # a server-initiated close needs the client's ack before another window opens
             self.pending_close_window_id = window
-        log("Inventory", "%s closed the inventory" % self.name)
+        log("Inventory", "%s closed the window %d" % (self.name, window))
 
     def on_client_close_window(self, window_id):
         """PocketMine InventoryManager::onClientRemoveWindow.
@@ -1742,12 +1809,13 @@ class Session:
         The ack is always sent back - the client expects one even when it initiated the
         close itself - and any window open deferred behind this close now runs.
         """
+        wtype = self.open_window_type or WINDOW_INVENTORY
         self.send_packet(
             PID_CONTAINER_CLOSE,
-            build_container_close(window_id, WINDOW_INVENTORY),
+            build_container_close(window_id, wtype),
         )
         if window_id == self.open_window_id:
-            self.open_window = False
+            self.close_main_inventory(notify=False)
         if self.pending_close_window_id == window_id:
             self.pending_close_window_id = None
             if self.pending_open is not None:
