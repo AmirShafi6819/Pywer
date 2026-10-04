@@ -229,16 +229,26 @@ def _build_chunk_job(cx, cz):
 
 class Session:
     RESEND_AFTER = 1.0
+    RESEND_BACKOFF = 1.5  # per-retry multiplier
+    RESEND_BACKOFF_MAX = 4.0  # ceiling for that delay
+    MAX_RETRIES = 10  # a datagram this old means the reliable channel is unusable
+    RESENDS_PER_TICK = 32  # spread an expired window instead of re-blasting it at once
     # Transport resource ceilings. RakNet sequences are 24-bit and the counters are
     # extended monotonically in memory, so these only bound how much state a single
     # peer is allowed to make us hold before we treat it as dead.
-    MAX_PENDING = 1024
+    # MAX_PENDING is deliberately generous: a spawn burst of chunk packets legitimately
+    # puts hundreds of datagrams in flight before the first ACK can round-trip, so the
+    # backlog alone never proves anything. It is only the threshold at which we start
+    # looking for ACK silence (ACK_STALL_TIMEOUT) before declaring the peer dead.
+    MAX_PENDING = 4096
+    ACK_STALL_TIMEOUT = 10.0
     MAX_QUEUE = 1024
     MAX_GAP = 1024
     MAX_ORDER_WINDOW = 4096
     MAX_SPLITS = 64
     MAX_SPLIT_PARTS = 8192
     SPLIT_TTL = 10.0
+    MAX_ACK_RANGE = 4096  # sequences one range record may expand to
 
     @staticmethod
     def _extend_seq(wire, ref):
@@ -278,6 +288,7 @@ class Session:
         self.split_id = 0
         self.pending = {}
         self.last_rx = time.time()
+        self.last_ack_at = time.time()
         self.compress = False
         self.cipher = None
         self.player = None
@@ -683,17 +694,22 @@ class Session:
         # Keep the datagram in pending even when the send fails: tick() resends it.
         if not self._udp(self._datagram_bytes(seq, frames)):
             dbg("RakNet", "datagram %d not sent, will retry" % seq)
-        self.pending[seq] = (time.time(), frames)
+        self.pending[seq] = (time.time(), frames, 0)
 
-    def _resend_datagram(self, seq, frames):
+    def _resend_datagram(self, seq, ent, now=None):
         """Retransmit *seq* under its original sequence number.
 
         Reusing the wire sequence is what lets the receiver fill the exact gap it
         reported; minting a new one leaves the original gap permanently open.
+
+        `ent` is the pending entry, so the retry counter survives across retransmits and
+        `tick()` can back the next attempt off instead of re-blasting on a fixed timer.
         """
+        frames = ent[1]
+        retries = (ent[2] if len(ent) > 2 else 0) + 1
         if not self._udp(self._datagram_bytes(seq, frames)):
             dbg("RakNet", "retransmit %d not sent, will retry" % seq)
-        self.pending[seq] = (time.time(), frames)
+        self.pending[seq] = (now if now is not None else time.time(), frames, retries)
 
     def _close_for(self, reason):
         dbg("RakNet", "closing %s: %s" % (self.addr, reason))
@@ -703,10 +719,16 @@ class Session:
         """Reliable-ordered, channel 0, with splitting."""
         if self.state == "CLOSED":
             return
-        if len(self.pending) >= self.MAX_PENDING:
-            # The peer keeps talking (last_rx) but never acknowledges: it is either
-            # broken or hostile. Holding one datagram per unsilenced tick would grow
-            # without bound, so drop the connection instead of buffering forever.
+        # A spawn burst of chunk packets legitimately fills the window before the first
+        # ACK can round-trip (a few dozen chunks is hundreds of datagrams, and on a
+        # 150-250ms link the ACKs are still in flight for several ticks), so the backlog
+        # on its own is not evidence of anything. Only a peer that keeps talking while
+        # never acknowledging again is broken or hostile, and that is what the
+        # ACK-silence check is here to detect.
+        if (
+            len(self.pending) >= self.MAX_PENDING
+            and time.time() - self.last_ack_at > self.ACK_STALL_TIMEOUT
+        ):
             self._close_for(
                 "peer stopped acknowledging (%d unsilenced datagrams)"
                 % len(self.pending)
@@ -864,16 +886,30 @@ class Session:
         r = ByteReader(data, 1)
         n = r.read_u16_be()
         out = []
+        cap = Session.MAX_ACK_RANGE
         for _ in range(n):
             if r.read_u8():
                 out.append(r.read_u24_le())
             else:
                 a = r.read_u24_le()
                 b = r.read_u24_le()
-                out.extend(range(a, min(b, a + 4096) + 1))
+                if b < a:
+                    # The range straddles the 24-bit wrap: the sender counted past
+                    # 0xFFFFFF and back to 0. range(a, b + 1) is empty there, so every
+                    # ack in it was silently discarded and the peer retransmitted the
+                    # whole window for nothing. Emit both halves, capped so a hostile
+                    # range cannot materialise 16M entries.
+                    head = min(0x1000000 - a, cap)
+                    out.extend(range(a, a + head))
+                    out.extend(range(0, min(b + 1, cap - head)))
+                else:
+                    out.extend(range(a, min(b, a + cap - 1) + 1))
         return out
 
     def _on_ack(self, data):
+        # Any ACK at all proves the peer is still acknowledging, which is what the
+        # stalled-window check in send_rak keys off.
+        self.last_ack_at = time.time()
         for wire in self._records(data):
             self.pending.pop(self._extend_seq(wire, self.send_seq), None)
 
@@ -882,7 +918,7 @@ class Session:
             seq = self._extend_seq(wire, self.send_seq)
             ent = self.pending.get(seq)
             if ent:
-                self._resend_datagram(seq, ent[1])
+                self._resend_datagram(seq, ent)
 
     def tick(self, now):
         if self.spawned:
@@ -898,23 +934,50 @@ class Session:
                 self.hurt_time -= 1
         # RakNet: 0xA0 acknowledges, 0xC0 reports a gap the sender must fill.
         if self.ack_q:
-            self._udp(self._ackpkt(0xA0, self.ack_q))
+            for pk in self._ackpkts(0xA0, self.ack_q):
+                self._udp(pk)
             self.ack_q = []
         if self.nack_q:
-            self._udp(self._ackpkt(0xC0, self.nack_q))
+            for pk in self._ackpkts(0xC0, self.nack_q):
+                self._udp(pk)
             self.nack_q = []
-        for s, (t, frames) in list(self.pending.items()):
-            if now - t > self.RESEND_AFTER:
-                dbg("RakNet", "resend seq %d" % s)
-                self._resend_datagram(s, frames)
+        # Expiring entries are retried on a per-packet backoff and capped per tick: a
+        # burst that all went out at the same instant would otherwise all come due at
+        # the same instant too, and re-transmit as one storm straight into a link that
+        # is already struggling.
+        resends = 0
+        for s, ent in list(self.pending.items()):
+            t, retries = ent[0], ent[2]
+            delay = min(
+                self.RESEND_AFTER * (self.RESEND_BACKOFF ** retries),
+                self.RESEND_BACKOFF_MAX,
+            )
+            if now - t <= delay:
+                continue
+            if retries >= self.MAX_RETRIES:
+                self._close_for(
+                    "datagram %d still unacknowledged after %d retries" % (s, retries)
+                )
+                return
+            if resends >= self.RESENDS_PER_TICK:
+                break
+            resends += 1
+            dbg("RakNet", "resend seq %d (attempt %d)" % (s, retries + 1))
+            self._resend_datagram(s, ent, now)
         if self.splits:
             for sid in [
                 sid for sid, e in self.splits.items() if now - e["t"] > self.SPLIT_TTL
             ]:
                 del self.splits[sid]
 
-    @staticmethod
-    def _ackpkt(pid, seqs):
+    def _ackpkts(self, pid, seqs):
+        """Encode an ACK/NACK, splitting it across datagrams when it would exceed the MTU.
+
+        A lossy burst encodes to several KB of records. Crammed into one UDP datagram
+        that exceeds the path MTU it is dropped (or IP-fragmented and then dropped on
+        most paths), so the peer never learns what arrived and retransmits the entire
+        window anyway - the exact traffic the ACK was meant to prevent.
+        """
         # Truncate before sorting: a range must never straddle the 24-bit wrap or the
         # receiver would decode an inverted (empty) range and silently drop the acks.
         seqs = sorted(set(s & 0xFFFFFF for s in seqs))
@@ -933,7 +996,22 @@ class Session:
                     + seqs[j].to_bytes(3, "little")
                 )
             i = j + 1
-        return bytes([pid]) + struct.pack(">H", len(recs)) + b"".join(recs)
+
+        limit = max(64, self.mtu - 28)
+        header = 1 + 2  # packet id + record count
+        out = []
+        cur = []
+        used = header
+        for rec in recs:
+            if cur and used + len(rec) > limit:
+                out.append(bytes([pid]) + struct.pack(">H", len(cur)) + b"".join(cur))
+                cur = []
+                used = header
+            cur.append(rec)
+            used += len(rec)
+        if cur:
+            out.append(bytes([pid]) + struct.pack(">H", len(cur)) + b"".join(cur))
+        return out
 
     def on_rak_payload(self, p):
         if not p:
