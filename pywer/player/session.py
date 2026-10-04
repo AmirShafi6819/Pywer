@@ -365,9 +365,9 @@ class Session:
         self.open_window_type = None
         self.seen_item_use = set()
         self.last_item_use_key = None
-        self.last_item_use_source = None
         self.last_item_use_at = 0.0
         self.last_item_use_cancelled = False
+        self.last_item_use_reports = {}
         self.seen_place_rejects = set()
         self.seen_slot_mappings = set()
         self._pending_slots = set()
@@ -2071,9 +2071,16 @@ class Session:
         standalone InventoryTransaction, and pywer reads both. Whether a client uses one
         or the other - or both for the same click - is not something the protocol
         guarantees, so the first report runs the whole thing (prediction, the interact
-        hook, the item's own effect, block placement) and a second report of the same
-        click from the other transport within ITEM_USE_DEDUP_WINDOW reuses that verdict
-        instead of firing the event and consuming the item twice.
+        hook, the item's own effect, block placement) and a later report of the same
+        click from the other transport reuses that verdict instead of firing the event
+        and consuming the item twice.
+
+        Deciding that by "the other transport said the same thing recently" is not
+        enough: two genuine clicks can be identical (two air clicks with the same
+        position and face), so the reports of each click are counted per transport and
+        only a transport that has reported this click identity *more* often than its
+        counterpart is a fresh click. That keeps both halves of one click deduplicated
+        while still dispatching the next click, in any arrival order.
 
         Returns True when the click was allowed to proceed.
         """
@@ -2082,10 +2089,15 @@ class Session:
         key = (action, tuple(pos) if pos is not None else None, tx.get("face"))
         now = time.monotonic()
         if (
-            source != self.last_item_use_source
-            and key == self.last_item_use_key
-            and (now - self.last_item_use_at) <= self.ITEM_USE_DEDUP_WINDOW
+            key != self.last_item_use_key
+            or (now - self.last_item_use_at) > self.ITEM_USE_DEDUP_WINDOW
         ):
+            self.last_item_use_key = key
+            self.last_item_use_reports = {}
+        self.last_item_use_at = now
+        reports = self.last_item_use_reports
+        reports[source] = reports.get(source, 0) + 1
+        if reports[source] <= sum(n for src, n in reports.items() if src != source):
             return not self.last_item_use_cancelled
         self._trace_item_use(tx, source)
         # The client has already rendered this click locally; record what it expects so
@@ -2098,16 +2110,13 @@ class Session:
         ev = events.call(
             PlayerInteractEvent(
                 self,
-                tx.get("item"),
+                self._held_slot_item() or ITEM_AIR,
                 action,
                 None if action == ACTION_CLICK_AIR else key[1],
                 tx.get("face"),
             )
         )
         cancelled = bool(ev.is_cancelled)
-        self.last_item_use_key = key
-        self.last_item_use_source = source
-        self.last_item_use_at = now
         self.last_item_use_cancelled = cancelled
         if cancelled:
             return False
@@ -2293,11 +2302,14 @@ class Session:
                     it = c3.items[i]
                     if it[0] != 0 and it[1] > 0:
                         leftover = add_item(self.inventory, it)
+                        placed = 0
                         if leftover > 0:
                             ikey = item_key_for_id(it[0])
                             if ikey:
-                                self.srv.drop_item(self.feet(), ikey, leftover)
-                        c3.items[i] = ITEM_AIR
+                                placed = self.srv.drop_item(self.feet(), ikey, leftover)
+                        # Anything the world refused to take stays in the container
+                        # instead of disappearing with the cleared slot.
+                        c3.items[i] = item_tuple(it[0], leftover - placed, it[2])
                 self.sync_inventory()
         self.open_window = False
         self.open_window_id = 0

@@ -30,6 +30,7 @@ from pywer.packets.abilities import (
 )
 from pywer.packets.spawn import build_add_player
 from pywer.packets.start_game import build_start_game
+from pywer.player.inventory import ITEM_AIR
 from pywer.player.inventory_manager import InventoryError, InventoryManager
 from pywer.player.session import Session
 from pywer.protocol.flags import (
@@ -38,12 +39,17 @@ from pywer.protocol.flags import (
     BA_START_BREAK,
     F_START_FLYING,
 )
+from pywer.protocol.inventory import WINDOW_WORKBENCH
 from pywer.protocol.packet_ids import (
     PID_PACK_RESPONSE,
     PID_START_GAME,
     PID_UPDATE_ABILITIES,
 )
-from pywer.protocol.transaction import ACTION_CLICK_AIR, ACTION_CLICK_BLOCK
+from pywer.protocol.transaction import (
+    ACTION_CLICK_AIR,
+    ACTION_CLICK_BLOCK,
+    read_block_pos,
+)
 from pywer.util.serializer import ByteReader, ByteWriter
 from pywer.world.blocks import ITEM_TO_KEY, item_key_for_id
 
@@ -342,6 +348,68 @@ class TestPlayerInteractEvent(DispatchCase):
         self.assertEqual(len(seen), 2)
         self.assertEqual(sess.try_place_block.call_count, 2)
 
+    def test_two_clicks_arriving_in_any_interleaving_are_both_dispatched(self):
+        # Both transports may report the same click, so four reports can arrive in any
+        # order. Deduplication has to swallow exactly two of them - the naive
+        # "the pair is complete now, forget the key" rule drops the second click when
+        # one transport's pair arrives ahead of the other's, and dispatches it twice
+        # when one transport's two reports arrive as a block.
+        tx = use_item_tx(ACTION_CLICK_AIR, pos=(0, 0, 0), face=0)
+        interleavings = (
+            ("auth_input", "transaction", "auth_input", "transaction"),
+            ("auth_input", "transaction", "transaction", "auth_input"),
+            ("transaction", "auth_input", "transaction", "auth_input"),
+            ("auth_input", "auth_input", "transaction", "transaction"),
+            ("transaction", "transaction", "auth_input", "auth_input"),
+        )
+        for order in interleavings:
+            with self.subTest(order=order):
+                sess = self.make_session()
+                seen = self.watch(PlayerInteractEvent)
+                for source in order:
+                    sess.handle_item_use(dict(tx), source)
+
+                self.assertEqual(len(seen), 2)
+
+    def test_a_click_reported_only_by_the_other_transport_is_not_swallowed(self):
+        # The reported defect: click 1 is reported by both transports and click 2 only
+        # by the other one, so the still-armed key of click 1 deduplicates click 2 away.
+        tx = use_item_tx(ACTION_CLICK_AIR, pos=(0, 0, 0), face=0)
+        sequences = (
+            ("auth_input", "transaction", "transaction"),
+            ("transaction", "auth_input", "auth_input"),
+            ("transaction", "auth_input", "transaction"),
+            ("auth_input", "transaction", "auth_input"),
+        )
+        for order in sequences:
+            with self.subTest(order=order):
+                sess = self.make_session()
+                seen = self.watch(PlayerInteractEvent)
+                for source in order:
+                    sess.handle_item_use(dict(tx), source)
+
+                self.assertEqual(len(seen), 2)
+
+    def test_interact_event_carries_the_held_item_not_the_client_claim(self):
+        sess = self.make_session()
+        seen = self.watch(PlayerInteractEvent)
+        sess.inventory[sess.selected_slot] = (1, 3, 0)
+
+        tx = use_item_tx(ACTION_CLICK_BLOCK)
+        tx["item"] = {"id": 9999, "count": 64, "meta": 0}
+        sess.handle_item_use(tx, "transaction")
+
+        self.assertEqual(seen[0].item, (1, 3, 0))
+        self.assertNotIsInstance(seen[0].item, dict)
+
+    def test_empty_hand_reports_the_air_tuple(self):
+        sess = self.make_session()
+        seen = self.watch(PlayerInteractEvent)
+
+        sess.handle_item_use(use_item_tx(ACTION_CLICK_AIR, pos=(0, 0, 0)), "transaction")
+
+        self.assertEqual(seen[0].item, ITEM_AIR)
+
     def test_cancelled_interact_never_reaches_placement(self):
         sess = self.make_session()
         sess.try_place_block = MagicMock()
@@ -384,6 +452,22 @@ class TestLegacyPlayerAction(DispatchCase):
         sess.start_break = MagicMock()
         sess.handle_player_action(player_action_body(sess.rid, BA_START_BREAK, (10, 64, 10), 1))
         sess.start_break.assert_called_once_with((10, 64, 10), 1)
+
+    def test_start_break_below_y_zero_reaches_the_handler(self):
+        # Y travels as an unsigned varint, so without sign extension the decoder turns
+        # -1 into 4294967295 and every block below y=0 is rejected as out of world.
+        sess = self.make_session()
+        sess.start_break = MagicMock()
+        sess.handle_player_action(
+            player_action_body(sess.rid, BA_START_BREAK, (10, -1, 10), 1)
+        )
+        sess.start_break.assert_called_once_with((10, -1, 10), 1)
+
+    def test_read_block_pos_sign_extends_unsigned_y(self):
+        w = ByteWriter()
+        w.write_varint32(-3).write_varuint32(-1 & 0xFFFFFFFF).write_varint32(7)
+
+        self.assertEqual(read_block_pos(ByteReader(w.get())), (-3, -1, 7))
 
     def test_predict_destroy_is_reported_but_never_honoured(self):
         sess = self.make_session()
@@ -437,7 +521,7 @@ class TestPlayerDropItemEvent(DispatchCase):
         self.legacy_id = next(k for k in ITEM_TO_KEY if item_key_for_id(k))
         self.lst = [(self.legacy_id, 5, 0)]
         self.srv = MagicMock()
-        self.srv.drop_item.return_value = True
+        self.srv.drop_item.side_effect = lambda pos, key, count=1: count
         self.sess = MagicMock()
         self.sess.srv = self.srv
         self.sess.feet.return_value = (0.0, 64.0, 0.0)
@@ -458,6 +542,15 @@ class TestPlayerDropItemEvent(DispatchCase):
         self.assertEqual(changed, {(id(self.lst), 0)})
         self.assertEqual(self.lst[0][1], 3)
         self.srv.drop_item.assert_called_once()
+
+    def test_only_what_reached_the_world_is_deducted(self):
+        self.srv.drop_item.side_effect = None
+        self.srv.drop_item.return_value = 1
+
+        changed = InventoryManager(self.sess)._drop(2, (0, 0))
+
+        self.assertEqual(changed, {(id(self.lst), 0)})
+        self.assertEqual(self.lst[0], (self.legacy_id, 4, 0))
 
 
 class TestEntityLifecycleEvents(DispatchCase):
@@ -501,6 +594,48 @@ class TestEntityLifecycleEvents(DispatchCase):
 
         self.assertFalse(mgr.drop_item((0.0, 64.0, 0.0), "stone", 1))
         self.assertEqual(mgr.entities, {})
+
+    def test_vetoed_second_stack_reports_only_the_stacks_that_spawned(self):
+        mgr = self.make_manager()
+        events.subscribe(
+            EntitySpawnEvent,
+            lambda ev: ev.cancel() if mgr.entities else None,
+            plugin=self._plugin,
+        )
+
+        placed = mgr.drop_item((0.0, 64.0, 0.0), "stone", 100)
+
+        self.assertEqual(placed, 64)
+        stacks = [e for e in mgr.entities.values() if isinstance(e, ItemEntity)]
+        self.assertEqual(sum(e.count for e in stacks), 64)
+
+
+class TestCraftingCloseAccounting(DispatchCase):
+    def test_results_the_world_refuses_stay_in_the_container(self):
+        sess = self.make_session()
+        sess.open_window = True
+        sess.open_window_type = WINDOW_WORKBENCH
+        c3 = sess.containers.complex.get("crafting3x3")
+        c3.items[0] = (1, 64, 0)
+        for i in range(len(sess.inventory)):
+            sess.inventory[i] = (1, 64, 0)
+        sess.srv.drop_item.return_value = 40
+
+        sess.close_main_inventory()
+
+        self.assertEqual(c3.items[0], (1, 24, 0))
+
+    def test_results_are_cleared_once_the_world_takes_them(self):
+        sess = self.make_session()
+        sess.open_window = True
+        sess.open_window_type = WINDOW_WORKBENCH
+        c3 = sess.containers.complex.get("crafting3x3")
+        c3.items[0] = (1, 10, 0)
+        sess.srv.drop_item.return_value = 10
+
+        sess.close_main_inventory()
+
+        self.assertEqual(c3.items[0], ITEM_AIR)
 
 
 class TestProjectileHitEvent(DispatchCase):

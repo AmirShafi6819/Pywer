@@ -112,9 +112,13 @@ class InventoryManager:
         ev = events.call(PlayerDropItemEvent(self.session, (item[0], count, item[2])))
         if ev.is_cancelled:
             raise InventoryError("drop cancelled by plugin")
-        if not self.session.srv.drop_item(self.session.feet(), key, count):
+        # Only what actually reached the world is paid for: a plugin may veto one stack
+        # of a multi-stack drop, and refunding the whole request would destroy the
+        # stacks that were never spawned.
+        placed = self.session.srv.drop_item(self.session.feet(), key, count)
+        if not placed:
             raise InventoryError("cannot drop item")
-        lst[i] = item_tuple(item[0], item[1] - count, item[2])
+        lst[i] = item_tuple(item[0], item[1] - placed, item[2])
         return {(id(lst), i)}
 
     def _destroy(self, count, src):

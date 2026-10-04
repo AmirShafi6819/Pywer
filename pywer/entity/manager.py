@@ -204,16 +204,23 @@ class EntityManager:
         count: int = 1,
         motion: Optional[Tuple[float, float, float]] = None,
         now: Optional[float] = None,
-    ) -> bool:
-        """Drops an item entity in the world, merging with nearby matching stacks if possible."""
+    ) -> int:
+        """Drops item entities, merging with nearby matching stacks if possible.
+
+        Returns how many items actually reached the world (merged into an existing stack
+        or spawned as an entity). A plugin vetoing EntitySpawnEvent refuses only the
+        stack it vetoed, so the caller has to be told the real number - anything that
+        refunds or deducts a whole request from this result would destroy items that
+        were never spawned.
+        """
         from ..world.blocks import ITEM_RUNTIME
         from ..player.inventory import MAX_STACK
 
         if item_key not in ITEM_RUNTIME:
-            return False
+            return 0
         count = int(count)
         if count <= 0:
-            return False
+            return 0
 
         now = time.time() if now is None else now
         px, py, pz = float(pos[0]), float(pos[1]), float(pos[2])
@@ -221,6 +228,7 @@ class EntityManager:
         # Merge into nearby matching stacks first, but never past the stack limit - an
         # unbounded merge is what let a single entity hold an arbitrary count, which the
         # pickup path would then duplicate. Anything that does not fit stays behind.
+        placed = 0
         for e in self.entities_near((px, py, pz), radius=MERGE_RANGE):
             if count <= 0:
                 break
@@ -232,18 +240,17 @@ class EntityManager:
             absorbed = min(room, count)
             e.count += absorbed
             count -= absorbed
+            placed += absorbed
             e.age = 0.0
             e.spawned_at = now
             e.pickup_at = now + PICKUP_DELAY
         if count <= 0:
-            return True
+            return placed
 
         # A single entity never holds more than one stack: otherwise pickup accounting
         # would have to hand out partial stacks that no client expects.
-        spawned_any = False
         while count > 0:
             take = min(count, MAX_STACK)
-            count -= take
             rand_motion = motion or (
                 random.random() * 0.2 - 0.1,
                 0.2,
@@ -260,12 +267,14 @@ class EntityManager:
                 )
                 is None
             ):
-                # A plugin vetoed EntitySpawnEvent. Whatever already landed in the world
-                # is real and has to be paid for, so the refusal ends the drop instead of
-                # letting the caller keep items that are already lying on the ground.
+                # A plugin vetoed EntitySpawnEvent for this stack. Whatever already
+                # landed in the world is real and has to be paid for; the refused
+                # stacks were never spawned, so they stop here and the caller keeps
+                # them instead of the whole request vanishing.
                 break
-            spawned_any = True
-        return spawned_any
+            count -= take
+            placed += take
+        return placed
 
     def tick(
         self, now: float, dt: float, world_is_solid: Callable[[int, int, int], bool]
