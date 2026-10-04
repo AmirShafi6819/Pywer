@@ -229,6 +229,33 @@ def _build_chunk_job(cx, cz):
 
 class Session:
     RESEND_AFTER = 1.0
+    # Transport resource ceilings. RakNet sequences are 24-bit and the counters are
+    # extended monotonically in memory, so these only bound how much state a single
+    # peer is allowed to make us hold before we treat it as dead.
+    MAX_PENDING = 1024
+    MAX_QUEUE = 1024
+    MAX_GAP = 1024
+    MAX_ORDER_WINDOW = 4096
+    MAX_SPLITS = 64
+    MAX_SPLIT_PARTS = 8192
+    SPLIT_TTL = 10.0
+
+    @staticmethod
+    def _extend_seq(wire, ref):
+        """Map a 24-bit wire sequence onto the monotonic sequence of *ref*.
+
+        Both directions use 24-bit counters on the wire. Keeping a monotonic
+        counter in memory and re-deriving the window here is what keeps duplicate
+        detection, gap detection and retransmission correct across the wrap.
+        """
+        if ref is None or ref < 0:
+            return wire
+        cand = (ref & ~0xFFFFFF) | wire
+        if cand > ref + 0x800000:
+            cand -= 0x1000000
+        elif cand + 0x800000 < ref:
+            cand += 0x1000000
+        return cand
 
     def __init__(self, srv, addr, mtu, guid):
         self.srv = srv
@@ -241,6 +268,7 @@ class Session:
         self.nack_q = []
         self.max_seq = -1
         self.seen_rel = set()
+        self.max_rel = -1
         self.order_next = {}
         self.order_buf = {}
         self.splits = {}
@@ -646,16 +674,44 @@ class Session:
     def _udp(self, data):
         return self.srv.send(data, self.addr)
 
+    def _datagram_bytes(self, seq, frames):
+        return b"\x84" + (seq & 0xFFFFFF).to_bytes(3, "little") + b"".join(frames)
+
     def _send_datagram(self, frames):
         seq = self.send_seq
         self.send_seq += 1
         # Keep the datagram in pending even when the send fails: tick() resends it.
-        if not self._udp(b"\x84" + seq.to_bytes(3, "little") + b"".join(frames)):
+        if not self._udp(self._datagram_bytes(seq, frames)):
             dbg("RakNet", "datagram %d not sent, will retry" % seq)
         self.pending[seq] = (time.time(), frames)
 
+    def _resend_datagram(self, seq, frames):
+        """Retransmit *seq* under its original sequence number.
+
+        Reusing the wire sequence is what lets the receiver fill the exact gap it
+        reported; minting a new one leaves the original gap permanently open.
+        """
+        if not self._udp(self._datagram_bytes(seq, frames)):
+            dbg("RakNet", "retransmit %d not sent, will retry" % seq)
+        self.pending[seq] = (time.time(), frames)
+
+    def _close_for(self, reason):
+        dbg("RakNet", "closing %s: %s" % (self.addr, reason))
+        self.state = "CLOSED"
+
     def send_rak(self, payload):
         """Reliable-ordered, channel 0, with splitting."""
+        if self.state == "CLOSED":
+            return
+        if len(self.pending) >= self.MAX_PENDING:
+            # The peer keeps talking (last_rx) but never acknowledges: it is either
+            # broken or hostile. Holding one datagram per unsilenced tick would grow
+            # without bound, so drop the connection instead of buffering forever.
+            self._close_for(
+                "peer stopped acknowledging (%d unsilenced datagrams)"
+                % len(self.pending)
+            )
+            return
         maxp = self.mtu - 28 - 4 - 24
         chunks = [payload[i : i + maxp] for i in range(0, len(payload), maxp)] or [b""]
         oi = self.ord_idx
@@ -666,9 +722,9 @@ class Session:
         for i, c in enumerate(chunks):
             sp = len(chunks) > 1
             f = bytes([(3 << 5) | (0x10 if sp else 0)]) + struct.pack(">H", len(c) * 8)
-            f += self.rel_idx.to_bytes(3, "little")
+            f += (self.rel_idx & 0xFFFFFF).to_bytes(3, "little")
             self.rel_idx += 1
-            f += oi.to_bytes(3, "little") + b"\x00"
+            f += (oi & 0xFFFFFF).to_bytes(3, "little") + b"\x00"
             if sp:
                 f += struct.pack(">IHI", len(chunks), sid, i)
             frames.append(f + c)
@@ -714,20 +770,25 @@ class Session:
     # ---- receive
     def on_datagram(self, data):
         self.last_rx = time.time()
-        flags = data[0]
-        if flags & 0x40:
+        if self.state == "CLOSED":
+            return
+        kind = data[0] & 0xE0
+        if kind == 0xA0:  # RakNet ID_ACK
             return self._on_ack(data)
-        if flags & 0x20:
+        if kind == 0xC0:  # RakNet ID_NACK
             return self._on_nack(data)
         r = ByteReader(data, 1)
-        seq = r.read_u24_le()
+        seq = self._extend_seq(r.read_u24_le(), self.max_seq)
+        if len(self.ack_q) < self.MAX_QUEUE:
+            self.ack_q.append(seq)
         if seq in self.seen_seq:
             return
         self.seen_seq.add(seq)
-        self.ack_q.append(seq)
-        for s in range(self.max_seq + 1, seq):
-            if s not in self.seen_seq:
-                self.nack_q.append(s)
+        if seq > self.max_seq + 1:
+            start = max(self.max_seq + 1, seq - self.MAX_GAP)
+            for s in range(start, seq):
+                if s not in self.seen_seq and len(self.nack_q) < self.MAX_QUEUE:
+                    self.nack_q.append(s)
         self.max_seq = max(self.max_seq, seq)
         if len(self.seen_seq) > 8192:
             self.seen_seq = set(
@@ -751,16 +812,30 @@ class Session:
                 sp = (r.read_u32_be(), r.read_u16_be(), r.read_u32_be())
             payload = r.read_bytes(ln)
             if ridx is not None:
+                ridx = self._extend_seq(ridx, self.max_rel)
                 if ridx in self.seen_rel:
                     continue
                 self.seen_rel.add(ridx)
+                if ridx > self.max_rel:
+                    self.max_rel = ridx
                 if len(self.seen_rel) > 8192:
                     self.seen_rel = set(
-                        x for x in self.seen_rel if x > ridx - 4096
+                        x for x in self.seen_rel if x > self.max_rel - 4096
                     )
             if sp:
                 cnt, sid, idx = sp
-                ent = self.splits.setdefault(sid, {"cnt": cnt, "parts": {}})
+                if cnt == 0 or cnt > self.MAX_SPLIT_PARTS or idx >= cnt:
+                    self._close_for("invalid split frame (cnt=%d idx=%d)" % (cnt, idx))
+                    return
+                if sid not in self.splits and len(self.splits) >= self.MAX_SPLITS:
+                    self._close_for("too many concurrent splits (%d)" % len(self.splits))
+                    return
+                ent = self.splits.setdefault(
+                    sid, {"cnt": cnt, "parts": {}, "t": time.time()}
+                )
+                if ent["cnt"] != cnt:
+                    self._close_for("split %d changed part count" % sid)
+                    return
                 ent["parts"][idx] = payload
                 if len(ent["parts"]) < ent["cnt"]:
                     continue
@@ -769,10 +844,14 @@ class Session:
                 )
                 del self.splits[sid]
             if oidx is not None and rel in (3, 7):
+                oidx = self._extend_seq(oidx, self.order_next.get(ch, -1))
                 nxt = self.order_next.get(ch, 0)
                 buf = self.order_buf.setdefault(ch, {})
                 if oidx < nxt:
                     continue
+                if oidx - nxt > self.MAX_ORDER_WINDOW:
+                    self._close_for("ordering window overflow on channel %d" % ch)
+                    return
                 buf[oidx] = payload
                 while nxt in buf:
                     self.on_rak_payload(buf.pop(nxt))
@@ -795,14 +874,15 @@ class Session:
         return out
 
     def _on_ack(self, data):
-        for s in self._records(data):
-            self.pending.pop(s, None)
+        for wire in self._records(data):
+            self.pending.pop(self._extend_seq(wire, self.send_seq), None)
 
     def _on_nack(self, data):
-        for s in self._records(data):
-            ent = self.pending.pop(s, None)
+        for wire in self._records(data):
+            seq = self._extend_seq(wire, self.send_seq)
+            ent = self.pending.get(seq)
             if ent:
-                self._send_datagram(ent[1])
+                self._resend_datagram(seq, ent[1])
 
     def tick(self, now):
         if self.spawned:
@@ -816,21 +896,28 @@ class Session:
                 self.attack_time -= 1
             if self.hurt_time > 0:
                 self.hurt_time -= 1
+        # RakNet: 0xA0 acknowledges, 0xC0 reports a gap the sender must fill.
         if self.ack_q:
-            self._udp(self._ackpkt(0xC0, self.ack_q))
+            self._udp(self._ackpkt(0xA0, self.ack_q))
             self.ack_q = []
         if self.nack_q:
-            self._udp(self._ackpkt(0xA0, self.nack_q))
+            self._udp(self._ackpkt(0xC0, self.nack_q))
             self.nack_q = []
         for s, (t, frames) in list(self.pending.items()):
             if now - t > self.RESEND_AFTER:
-                del self.pending[s]
                 dbg("RakNet", "resend seq %d" % s)
-                self._send_datagram(frames)
+                self._resend_datagram(s, frames)
+        if self.splits:
+            for sid in [
+                sid for sid, e in self.splits.items() if now - e["t"] > self.SPLIT_TTL
+            ]:
+                del self.splits[sid]
 
     @staticmethod
     def _ackpkt(pid, seqs):
-        seqs = sorted(set(seqs))
+        # Truncate before sorting: a range must never straddle the 24-bit wrap or the
+        # receiver would decode an inverted (empty) range and silently drop the acks.
+        seqs = sorted(set(s & 0xFFFFFF for s in seqs))
         recs = []
         i = 0
         while i < len(seqs):
