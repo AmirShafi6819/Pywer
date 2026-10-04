@@ -246,6 +246,9 @@ class Server:
         if sum((player_pos[i] - (af[i] + (0.0 if i != 1 else NETWORK_EYE_OFFSET))) ** 2 for i in range(3)) > 4.0:
             return False
         attacker.attack_time = 10
+        # Inbound AnimatePacket is not relayed, so without this other players never saw
+        # the swing of a hit - only the miss path (F_MISSED_SWING) animated anything.
+        attacker.broadcast_arm_swing()
         target.damage(1.0, attacker)
         return True
 

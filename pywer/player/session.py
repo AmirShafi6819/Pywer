@@ -15,8 +15,12 @@ from ..crypto.jwt import jwt_make_es384
 from ..event import (
     BlockBreakEvent,
     BlockPlaceEvent,
+    EntityDamageByEntityEvent,
+    EntityDamageEvent,
     PlayerChatEvent,
     PlayerCommandPreprocessEvent,
+    PlayerDeathEvent,
+    PlayerRespawnEvent,
 )
 from ..event import manager as events
 from ..log import dbg, log
@@ -1233,10 +1237,43 @@ class Session:
             [self._pk(PID_SET_ACTOR_MOTION, build_set_actor_motion(self.rid, self.motion))]
         )
 
-    def damage(self, amount, attacker=None):
+    def sync_attributes(self):
+        """Send UpdateAttributes so the client's health bar tracks the server's value.
+
+        PocketMine rebroadcasts attributes on every health change; pywer only ever sent
+        them once at spawn, so the bar stayed at 20/20 no matter how much damage landed.
+        """
+        self.send_packet(PID_UPDATE_ATTRIBUTES, build_update_attributes(self))
+
+    def damage(self, amount, attacker=None, source_rid=None, cause="entity_attack"):
+        """Entity::attack / EntityDamageEvent pipeline for players.
+
+        `source_rid` is the keyword Projectiles use; it resolves back to the shooting
+        session so an arrow hit carries the same knockback and event damager as a melee
+        hit. Without it a projectile landing on a player raised TypeError straight out
+        of EntityManager.tick and took the whole tick loop with it.
+        """
         if self.dead or self.hurt_time > 0:
             return False
-        self.health = max(0.0, self.health - max(0.0, float(amount)))
+        amount = float(amount)
+        if amount <= 0.0:
+            return False
+        if attacker is None and source_rid is not None and hasattr(self.srv, "playing"):
+            for s in self.srv.playing():
+                if s.rid == source_rid:
+                    attacker = s
+                    break
+        if attacker is not None:
+            ev = EntityDamageByEntityEvent(self, attacker, amount, cause)
+        else:
+            ev = EntityDamageEvent(self, amount, cause)
+        events.call(ev)
+        if ev.is_cancelled:
+            return False
+        amount = float(ev.amount)
+        if amount <= 0.0:
+            return False
+        self.health = max(0.0, self.health - amount)
         self.hurt_time = 10
         if attacker is not None:
             dx = self.feet()[0] - attacker.feet()[0]
@@ -1247,13 +1284,41 @@ class Session:
         self.srv.broadcast(
             [self._pk(PID_ACTOR_EVENT, build_actor_event(self.rid, ANIMATE_ACTION_HURT))]
         )
+        self.sync_attributes()
         if self.health <= 0:
-            self.dead = True
-            self.health = 0.0
-            self.teleport(SPAWN[0] + 0.5, SPAWN[1] + 1.0, SPAWN[2] + 0.5)
-            self.health = self.max_health
-            self.dead = False
+            self._on_death(attacker)
         return True
+
+    def _on_death(self, killer=None):
+        """Player::onDeath + immediate respawn: event, announcement, then heal and move."""
+        self.dead = True
+        self.health = 0.0
+        if killer is not None:
+            killer_name = getattr(killer, "name", None)
+            if not killer_name:
+                ident = getattr(killer, "identifier", "") or ""
+                killer_name = ident.rsplit(":", 1)[-1] or "something"
+            message = "§e%s was slain by %s" % (self.name, killer_name)
+        else:
+            killer_name = "nothing"
+            message = "§e%s died" % self.name
+        ev = events.call(PlayerDeathEvent(self, death_message=message))
+        if ev.death_message:
+            self.srv.broadcast([self._pk(PID_TEXT, build_text(0, "", ev.death_message))])
+        respawn_pos = (SPAWN[0] + 0.5, SPAWN[1] + 1.0, SPAWN[2] + 0.5)
+        self.teleport(*respawn_pos)
+        self.health = self.max_health
+        self.hurt_time = 0
+        self.fall_distance = 0.0
+        self.last_fall = 0.0
+        self.dead = False
+        self.sync_attributes()
+        self.send_data()
+        events.call(PlayerRespawnEvent(self, respawn_pos))
+        log(
+            "Player",
+            "%s died (killed by %s), respawned at %s" % (self.name, killer_name, respawn_pos),
+        )
 
     def send_data(self, to_all=False):
         """Entity::sendData: SetActorData with flags + bounding box (to everybody, or only to this player)."""
