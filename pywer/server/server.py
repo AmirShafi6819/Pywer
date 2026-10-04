@@ -8,7 +8,7 @@ import socket
 import struct
 import time
 
-from .. import config
+from .. import config, __version__
 from ..storage import WorldStorage, PlayerStorage, SAVE_INTERVAL
 from ..log import log, dbg
 from ..util.serializer import ByteReader, ByteWriter
@@ -64,16 +64,21 @@ GAMEMODE_NAMES = {
 }
 
 
-def build_motd(guid, port):
+def build_motd(guid, port, online=0):
     """Unconnected ping response.
 
-    The advertised game mode comes from config.GAMEMODE so the server list can never
-    claim a mode the server is not actually running.
+    Every advertised value comes from its own source of truth instead of a literal:
+    the game mode from config.GAMEMODE, the player limit from config.MAX_PLAYERS, the
+    version from pywer.__version__, and the online count from the caller so the server
+    list can never disagree with what the server is actually running or hosting.
     """
     mode = config.GAMEMODE & 0x7
-    return "MCPE;pywer-v0.9.1dev;%d;%s;0;1;%d;Minimal;%s;%d;%d;%d;" % (
+    return "MCPE;pywer-v%s;%d;%s;%d;%d;%d;Minimal;%s;%d;%d;%d;" % (
+        __version__,
         config.PROTOCOL,
         config.GAME_VERSION,
+        max(0, int(online)),
+        max(0, int(config.MAX_PLAYERS)),
         guid,
         GAMEMODE_NAMES.get(mode, "Survival"),
         mode,
@@ -127,7 +132,6 @@ class Server:
         self.load_world()
         self.plugin_mgr.enable_all()
         self.event_mgr.call(ServerLoadEvent(self))
-        self.motd = build_motd(self.guid, port)
 
     def send(self, data, addr):
         """UDP send that survives a full kernel send buffer."""
@@ -212,7 +216,9 @@ class Server:
         pid = data[0]
         if pid in (0x01, 0x02):
             t = data[1:9]
-            ms = self.motd.encode()
+            # Built per ping: the online count has to track the live session table, and
+            # a string frozen in __init__ advertised "0 players" for the rest of the run.
+            ms = build_motd(self.guid, self.port, len(self.sessions)).encode()
             self.send(
                 b"\x1c" + t + struct.pack(">Q", self.guid) + RAKNET_MAGIC + struct.pack(">H", len(ms)) + ms,
                 addr,
