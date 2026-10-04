@@ -169,6 +169,56 @@ class TestEntityManager(unittest.TestCase):
         self.assertIn(z2, near)
         self.assertNotIn(z3, near)
 
+    def test_entities_near_reaches_across_the_negative_chunk_boundary(self):
+        # int(-0.5) == 0, so a truncating scan of the interval x in [-0.5, 1.5] only
+        # visited chunk 0 and never saw the entity stored in chunk -1.
+        mgr = EntityManager(fake_server(rid=500))
+
+        west = mgr.spawn(ItemEntity, "dirt", 1, pos=(-0.2, 64.0, -0.2))
+        east = mgr.spawn(ItemEntity, "stone", 1, pos=(1.0, 64.0, 1.0))
+        self.assertEqual(west.chunk, (-1, -1))
+
+        near = mgr.entities_near((0.5, 64.0, 0.5), radius=1.0)
+
+        self.assertIn(west, near)
+        self.assertIn(east, near)
+
+    def test_entities_near_covers_the_whole_radius_on_both_axes(self):
+        mgr = EntityManager(fake_server(rid=510))
+
+        north = mgr.spawn(ItemEntity, "dirt", 1, pos=(-0.2, 64.0, -0.2))
+        far = mgr.spawn(ItemEntity, "sand", 1, pos=(-0.2, 64.0, -40.0))
+
+        near = mgr.entities_near((0.5, 64.0, 0.5), radius=1.0)
+
+        self.assertIn(north, near)
+        self.assertNotIn(far, near)
+
+    def test_an_unmapped_item_key_does_not_block_other_pickups(self):
+        # The item key belongs to the item, not the player: a stack the server has no
+        # runtime id for must be skipped on its own, never as a reason to stop walking
+        # the rest of the world's items for that tick.
+        dirt = ITEM_RUNTIME["dirt"]
+        stone = ITEM_RUNTIME["stone"]
+        player = FakePlayer((5.0, 65.0, 5.0))
+        mgr = EntityManager(fake_server(players=[player], rid=950))
+
+        unknown = mgr.spawn(ItemEntity, "mod:not_a_real_item", 1, pos=(5.0, 64.0, 5.0))
+        unknown.pickup_at = 0.0
+        valid = mgr.spawn(ItemEntity, "dirt", 3, pos=(5.0, 64.0, 5.0))
+        valid.pickup_at = 0.0
+        second = mgr.spawn(ItemEntity, "stone", 2, pos=(5.0, 64.0, 5.0))
+        second.pickup_at = 0.0
+
+        mgr.tick(0.0, 0.05, NO_FLOOR)
+
+        self.assertEqual(stack_total(player.inventory, dirt), 3)
+        self.assertEqual(stack_total(player.inventory, stone), 2)
+        self.assertEqual(unknown.count, 1)
+        self.assertIn(unknown.rid, mgr.entities)
+        self.assertNotIn(valid.rid, mgr.entities)
+        self.assertNotIn(second.rid, mgr.entities)
+
     def test_remove_entity(self):
         mgr = EntityManager(fake_server(rid=400))
 

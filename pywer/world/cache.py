@@ -1,5 +1,6 @@
 """Thread-safe in-memory cache for pre-built chunk payloads."""
 
+import math
 import threading
 
 
@@ -24,9 +25,14 @@ class ChunkCache:
             self._cache.pop((cx, cz), None)
 
     def invalidate_block(self, x, z):
-        """Evict the chunk containing block coordinates (x, z)."""
-        cx = int(x) >> 4
-        cz = int(z) >> 4
+        """Evict the chunk containing block coordinates (x, z).
+
+        Floor, do not truncate: int(-0.5) is 0, so a block just west of the origin
+        would evict chunk 0 while it actually lives in chunk -1, leaving the stale
+        payload served forever.
+        """
+        cx = math.floor(x) >> 4
+        cz = math.floor(z) >> 4
         self.invalidate(cx, cz)
 
     def clear(self):

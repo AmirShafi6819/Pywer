@@ -134,10 +134,14 @@ class EntityManager:
         """Finds all non-dead entities within euclidean radius of pos using chunk index."""
         px, py, pz = pos
         r_sq = radius * radius
-        min_cx = int(px - radius) >> 4
-        max_cx = int(px + radius) >> 4
-        min_cz = int(pz - radius) >> 4
-        max_cz = int(pz + radius) >> 4
+        # Chunk bounds must be floored, not truncated: int(-0.5) is 0 while
+        # math.floor(-0.5) is -1, so truncating dropped the whole -1 bucket from
+        # the scan and every entity just west/north of the origin became invisible
+        # to merges, projectile hits and mob target acquisition.
+        min_cx = math.floor(px - radius) >> 4
+        max_cx = math.floor(px + radius) >> 4
+        min_cz = math.floor(pz - radius) >> 4
+        max_cz = math.floor(pz + radius) >> 4
 
         res: List[Entity] = []
         for cx in range(min_cx, max_cx + 1):
@@ -287,12 +291,15 @@ class EntityManager:
 
             # Check item pickup for ItemEntity
             if isinstance(e, ItemEntity):
+                # An item key with no runtime id can never be handed to a player, so
+                # resolve it once per entity instead of per player: an early exit from
+                # the player loop used to make the whole item look like a hard stop.
+                item_id = ITEM_RUNTIME.get(e.item_key)
+                if item_id is None:
+                    continue
                 for p in players:
                     if not e.can_pickup(p.feet(), now, world_is_solid):
                         continue
-                    item_id = ITEM_RUNTIME.get(e.item_key)
-                    if item_id is None:
-                        break
                     # add_item already writes the slots it managed to fill, so the only
                     # correct bookkeeping is to remove exactly what was inserted. Treating
                     # a partial insert as "player full" left the whole stack in the world
