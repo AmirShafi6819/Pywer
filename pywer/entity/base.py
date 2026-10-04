@@ -1,5 +1,7 @@
 """Base class for all non-player world actors."""
 
+import math
+
 
 class Entity:
     """Base class for all non-player world actors."""
@@ -30,7 +32,10 @@ class Entity:
 
     @property
     def chunk(self):
-        return (int(self.pos[0]) >> 4, int(self.pos[2]) >> 4)
+        # Floor, not truncation: int(-0.5) is 0, which would bucket an entity just west
+        # of the origin into chunk 0 instead of -1 and disagree with the player's own
+        # chunk maths (Session uses math.floor too).
+        return (math.floor(self.pos[0]) >> 4, math.floor(self.pos[2]) >> 4)
 
     def feet(self):
         """Feet/base position for actor packets."""
