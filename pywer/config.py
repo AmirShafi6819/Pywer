@@ -35,6 +35,13 @@ def _opt(target, kind, key, default, doc, section=None):
     return (target, kind, key, default, doc, section)
 
 
+# GameType values the protocol defines. A value outside this set - whatever a save file,
+# a server.properties entry or a plugin hands us - is not a gamemode, and gamemode is
+# broadcast to every other player (AddPlayerPacket, the ability bitmask), so it is
+# validated before it can reach the wire.
+VALID_GAMEMODES = (0, 1, 2, 3, 5, 6)
+
+
 # ---- server.properties: the settings an ordinary user is expected to touch
 SIMPLE = [
     _opt("PORT", "int", "server-port", 19132, "UDP port the server listens on."),

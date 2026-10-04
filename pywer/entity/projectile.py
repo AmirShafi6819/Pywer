@@ -1,6 +1,9 @@
 """Projectile entities: arrows, snowballs, and trajectory physics."""
 
 import math
+
+from ..event import ProjectileHitEvent
+from ..event import manager as events
 from .base import Entity
 
 
@@ -62,11 +65,19 @@ class Projectile(Entity):
         from .physics import check_projectile_collisions
         hit_type, target_or_block, hit_pos = check_projectile_collisions(self, nearby, world_is_solid)
 
-        if hit_type == "block":
-            self.on_hit_block(target_or_block, hit_pos)
-            return True
-        elif hit_type == "entity":
-            self.on_hit_entity(target_or_block, hit_pos)
+        if hit_type in ("block", "entity"):
+            ev = events.call(ProjectileHitEvent(self, hit_type, target_or_block, hit_pos))
+            if ev.is_cancelled:
+                # Consumed without applying the hit. Letting the projectile keep flying
+                # instead would leave it intersecting the very surface it just hit, so
+                # check_projectile_collisions would report the same hit on the next tick
+                # and this event would be dispatched once per tick until it despawns.
+                self.dead = True
+                return True
+            if hit_type == "block":
+                self.on_hit_block(target_or_block, hit_pos)
+            else:
+                self.on_hit_entity(target_or_block, hit_pos)
             return True
 
         # In-flight aerodynamics: apply gravity and drag

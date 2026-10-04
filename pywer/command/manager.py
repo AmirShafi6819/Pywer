@@ -6,6 +6,10 @@ from typing import Any, Dict, List, Optional, Set
 from .base import Command
 from .sender import CommandSender, ConsoleCommandSender, PlayerCommandSender
 
+from ..data.item_table import ITEM_NAME
+from ..player.inventory import INVENTORY_SIZE
+from ..world.blocks import BLOCK_KEYS, ITEM_RUNTIME
+
 
 class CommandManager:
     """Manages command registration, alias mapping, permissions, and dispatching."""
@@ -193,11 +197,7 @@ class CommandManager:
                 )
 
             def execute(self, sender: CommandSender, args: List[str]) -> bool:
-                try:
-                    from ..world.palette import BLOCK_KEYS
-                    sender.send_message("blocks: " + ", ".join(BLOCK_KEYS[1:]))
-                except Exception as e:
-                    sender.send_message(f"Error listing blocks: {e}")
+                sender.send_message("blocks: " + ", ".join(BLOCK_KEYS[1:]))
                 return True
 
         class ItemsCommand(Command):
@@ -209,20 +209,16 @@ class CommandManager:
                 )
 
             def execute(self, sender: CommandSender, args: List[str]) -> bool:
-                try:
-                    from ..player.inventory import ITEM_RUNTIME
-                    sender.send_message(
-                        "items: "
-                        + ", ".join(
-                            sorted(
-                                k
-                                for k in ITEM_RUNTIME
-                                if k not in ("air", "water", "bedrock")
-                            )
+                sender.send_message(
+                    "items: "
+                    + ", ".join(
+                        sorted(
+                            k
+                            for k in ITEM_RUNTIME
+                            if k not in ("air", "water", "bedrock")
                         )
                     )
-                except Exception as e:
-                    sender.send_message(f"Error listing items: {e}")
+                )
                 return True
 
         class ToolsCommand(Command):
@@ -256,10 +252,17 @@ class CommandManager:
                     return True
                 if not args:
                     return False
-                p = getattr(sender, "player", None)
-                if p and hasattr(mgr.server, "give"):
+                try:
                     count = int(args[1]) if len(args) > 1 else 1
                     slot = int(args[2]) if len(args) > 2 else None
+                except ValueError:
+                    return False
+                if count < 1:
+                    return False
+                if slot is not None and not (0 <= slot < INVENTORY_SIZE):
+                    return False
+                p = getattr(sender, "player", None)
+                if p and hasattr(mgr.server, "give"):
                     mgr.server.give(p, args[0], count, slot)
                 return True
 
@@ -277,7 +280,6 @@ class CommandManager:
                     return True
                 p = getattr(sender, "player", None)
                 if p:
-                    from ..player.inventory import ITEM_NAME
                     sender.send_message(
                         "inv: "
                         + " ".join(
@@ -335,10 +337,15 @@ class CommandManager:
                 p = getattr(sender, "player", None)
                 if p:
                     f = p.feet()
-                    t = [
-                        (f[i] + float(v[1:] or 0)) if v.startswith("~") else float(v)
-                        for i, v in enumerate(args[:3])
-                    ]
+                    try:
+                        t = [
+                            (f[i] + float(v[1:] or 0)) if v.startswith("~") else float(v)
+                            for i, v in enumerate(args[:3])
+                        ]
+                    except ValueError:
+                        return False
+                    if not all(math.isfinite(v) for v in t):
+                        return False
                     p.teleport(*t)
                     sender.send_message("teleported to %.1f %.1f %.1f" % tuple(t))
                 return True

@@ -9,6 +9,8 @@ import random
 import time
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Type
 
+from ..event import EntityDespawnEvent, EntitySpawnEvent
+from ..event import manager as events
 from .base import Entity
 from .item import ItemEntity, MERGE_RANGE, PICKUP_DELAY
 
@@ -57,13 +59,21 @@ class EntityManager:
         self._local_rid += 1
         return self._local_rid
 
-    def spawn(self, entity_cls: Type[Entity], *args: Any, **kwargs: Any) -> Entity:
-        """Spawns an entity, adds it to the spatial index, and broadcasts spawn packet."""
+    def spawn(self, entity_cls: Type[Entity], *args: Any, **kwargs: Any) -> Optional[Entity]:
+        """Spawns an entity, adds it to the spatial index, and broadcasts spawn packet.
+
+        Returns None when a plugin cancelled the EntitySpawnEvent. Callers that ignore
+        the return value therefore spawn nothing rather than a half-registered entity:
+        the rid is allocated first, and an allocated-but-unused id is harmless.
+        """
         rid = kwargs.pop("rid", None)
         if rid is None:
             rid = self.alloc_rid()
 
         entity = entity_cls(self.srv, rid, *args, **kwargs)
+        ev = events.call(EntitySpawnEvent(entity, entity.pos))
+        if ev.is_cancelled:
+            return None
         self.entities[rid] = entity
         chunk = entity.chunk
         if chunk not in self.chunk_index:
@@ -117,6 +127,10 @@ class EntityManager:
                 self.chunk_index[chunk].discard(entity)
                 if not self.chunk_index[chunk]:
                     del self.chunk_index[chunk]
+
+            # Fired once the entity is out of every index, so a handler that queries the
+            # manager sees the same state the rest of the server already sees.
+            events.call(EntityDespawnEvent(entity))
 
             if hasattr(self.srv, "broadcast"):
                 try:
@@ -190,16 +204,23 @@ class EntityManager:
         count: int = 1,
         motion: Optional[Tuple[float, float, float]] = None,
         now: Optional[float] = None,
-    ) -> bool:
-        """Drops an item entity in the world, merging with nearby matching stacks if possible."""
+    ) -> int:
+        """Drops item entities, merging with nearby matching stacks if possible.
+
+        Returns how many items actually reached the world (merged into an existing stack
+        or spawned as an entity). A plugin vetoing EntitySpawnEvent refuses only the
+        stack it vetoed, so the caller has to be told the real number - anything that
+        refunds or deducts a whole request from this result would destroy items that
+        were never spawned.
+        """
         from ..world.blocks import ITEM_RUNTIME
         from ..player.inventory import MAX_STACK
 
         if item_key not in ITEM_RUNTIME:
-            return False
+            return 0
         count = int(count)
         if count <= 0:
-            return False
+            return 0
 
         now = time.time() if now is None else now
         px, py, pz = float(pos[0]), float(pos[1]), float(pos[2])
@@ -207,6 +228,7 @@ class EntityManager:
         # Merge into nearby matching stacks first, but never past the stack limit - an
         # unbounded merge is what let a single entity hold an arbitrary count, which the
         # pickup path would then duplicate. Anything that does not fit stays behind.
+        placed = 0
         for e in self.entities_near((px, py, pz), radius=MERGE_RANGE):
             if count <= 0:
                 break
@@ -218,31 +240,41 @@ class EntityManager:
             absorbed = min(room, count)
             e.count += absorbed
             count -= absorbed
+            placed += absorbed
             e.age = 0.0
             e.spawned_at = now
             e.pickup_at = now + PICKUP_DELAY
         if count <= 0:
-            return True
+            return placed
 
         # A single entity never holds more than one stack: otherwise pickup accounting
         # would have to hand out partial stacks that no client expects.
         while count > 0:
             take = min(count, MAX_STACK)
-            count -= take
             rand_motion = motion or (
                 random.random() * 0.2 - 0.1,
                 0.2,
                 random.random() * 0.2 - 0.1,
             )
-            self.spawn(
-                ItemEntity,
-                item_key,
-                take,
-                pos=(px, py, pz),
-                motion=rand_motion,
-                spawned_at=now,
-            )
-        return True
+            if (
+                self.spawn(
+                    ItemEntity,
+                    item_key,
+                    take,
+                    pos=(px, py, pz),
+                    motion=rand_motion,
+                    spawned_at=now,
+                )
+                is None
+            ):
+                # A plugin vetoed EntitySpawnEvent for this stack. Whatever already
+                # landed in the world is real and has to be paid for; the refused
+                # stacks were never spawned, so they stop here and the caller keeps
+                # them instead of the whole request vanishing.
+                break
+            count -= take
+            placed += take
+        return placed
 
     def tick(
         self, now: float, dt: float, world_is_solid: Callable[[int, int, int], bool]

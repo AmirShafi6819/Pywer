@@ -26,16 +26,24 @@ ABILITY_NO_CLIP = 17
 ABILITY_PRIVILEGED_BUILDER = 18
 
 
-def ability_bits(gamemode=None, flying=False):
+def ability_bits(gamemode=None, flying=False, allow_flight=None):
     """Enabled-ability bitmask for a player.
 
     PocketMine's comment on its own base layer: "ALL of these need to be set for the base
     layer, otherwise the client will cry". Leaving ABILITY_MINE unset makes the client refuse
     to break blocks and cancel the break immediately.
+
+    `gamemode` and `flying` are per-session values: abilities are re-sent whenever the
+    player's state changes, so taking them from the server default would silently hand a
+    restored creative player survival abilities. `allow_flight` is also per-session
+    (Player::$allowFlight); None keeps the gamemode-derived default so the historic
+    behaviour is unchanged for callers that do not know about it.
     """
     gamemode = config.GAMEMODE if gamemode is None else gamemode
     creative = gamemode in (1, 6)
     spectator = gamemode == 6
+    if allow_flight is None:
+        allow_flight = creative
     bits = 0
     for ability in (
         ABILITY_BUILD,
@@ -51,15 +59,19 @@ def ability_bits(gamemode=None, flying=False):
     if creative:
         bits |= (1 << ABILITY_INVULNERABLE) | (1 << ABILITY_INFINITE_RESOURCES)
     if gamemode in (1, 6):
-        bits |= (1 << ABILITY_ALLOW_FLIGHT) | (1 << ABILITY_NO_CLIP)
+        bits |= 1 << ABILITY_NO_CLIP
+    if allow_flight:
+        bits |= 1 << ABILITY_ALLOW_FLIGHT
     if flying:
         bits |= 1 << ABILITY_FLYING
     return bits
 
 
-def build_abilities_payload(unique_id, gamemode=None, flying=False, walk_speed=0.1, fly_speed=0.05):
+def build_abilities_payload(
+    unique_id, gamemode=None, flying=False, walk_speed=0.1, fly_speed=0.05, allow_flight=None
+):
     """AbilitiesData + one base layer (PlayerPermission::MEMBER, CommandPermission::NORMAL)."""
-    bits = ability_bits(gamemode, flying)
+    bits = ability_bits(gamemode, flying, allow_flight)
     set_abilities = bits | (1 << ABILITY_FLY_SPEED) | (1 << ABILITY_WALK_SPEED)
     w = ByteWriter()
     w.write_i64(unique_id)
