@@ -26,10 +26,7 @@ from ..protocol.packet_ids import (
 )
 from ..world.chunk import build_update_block
 from ..world.blocks import BLOCK_KEYS, BLOCK_RUNTIME, ITEM_RUNTIME, drops_for, item_key_for_id
-from ..data.item_table import ITEM_TABLE
-
-ITEM_NAME = {rid: name.split(":")[-1] for name, rid, _ in ITEM_TABLE}
-
+from ..data.item_table import ITEM_NAME
 from ..world.query import get_block, is_solid
 from ..world.state import CHUNK_CACHE, EDITS, mark_dirty, load_edits
 from ..world import item_entity as ie

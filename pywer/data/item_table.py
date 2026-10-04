@@ -1797,6 +1797,8 @@ ITEM_TABLE = [
 
 ITEM_ID_BY_NAME = {name: rid for name, rid, _ in ITEM_TABLE}
 
+ITEM_NAME = {rid: name.split(":")[-1] for name, rid, _ in ITEM_TABLE}
+
 def item_runtime_id(block_key):
     """Runtime item id for a block key such as "stone", or None if it is not an item."""
     return ITEM_ID_BY_NAME.get("minecraft:" + block_key)
