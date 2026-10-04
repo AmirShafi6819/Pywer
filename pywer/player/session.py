@@ -14,9 +14,11 @@ from ..crypto.ec import ecdh, pub_to_spki, spki_to_pub
 from ..crypto.jwt import jwt_make_es384
 from ..event import (
     BlockBreakEvent,
+    BlockInteractEvent,
     BlockPlaceEvent,
     PlayerChatEvent,
     PlayerCommandPreprocessEvent,
+    PlayerInteractEvent,
 )
 from ..event import manager as events
 from ..log import dbg, log
@@ -229,6 +231,11 @@ def _build_chunk_job(cx, cz):
 
 class Session:
     RESEND_AFTER = 1.0
+    # A client reports one click twice - once in PlayerAuthInput's embedded
+    # ItemInteractionData and once as a standalone InventoryTransaction - and which of the
+    # two (or whether both) actually arrives differs per client. Two reports of the same
+    # click are identified by source + click identity inside this window.
+    ITEM_USE_DEDUP_WINDOW = 0.25
 
     def __init__(self, srv, addr, mtu, guid):
         self.srv = srv
@@ -312,6 +319,10 @@ class Session:
         self.open_window_pos = None
         self.open_window_type = None
         self.seen_item_use = set()
+        self.last_item_use_key = None
+        self.last_item_use_source = None
+        self.last_item_use_at = 0.0
+        self.last_item_use_cancelled = False
         self.seen_place_rejects = set()
         self.seen_slot_mappings = set()
         self._pending_slots = set()
@@ -340,7 +351,7 @@ class Session:
         self.open_window_id = 0
         self.container_id = CONTAINER_ID_FIRST
         self.inventory_revision = 1
-        self.gamemode = config.GAMEMODE
+        self.gamemode = config.GAMEMODE if config.GAMEMODE in config.VALID_GAMEMODES else 0
         self.experience = 0
         self.experience_level = 0
         self.inv_manager = InventoryManager(self)
@@ -355,6 +366,36 @@ class Session:
         return info.stack_id if info else 0
 
     # ---- persistence
+    def restore_gamemode(self, saved):
+        """Restore gamemode and allow_flight from a player save.
+
+        Deliberately applied twice during a login: StartGamePacket has to announce the
+        gamemode during resource-pack negotiation, which is long before the rest of the
+        save is applied at SetLocalPlayerAsInitialized. Announcing the server default
+        there and correcting it afterwards would leave the client showing one gamemode
+        while the server plays another. allow_flight rides along because it is what turns
+        a restored creative player into one that can actually fly.
+        """
+        if not isinstance(saved, dict):
+            return
+        if "gamemode" in saved:
+            try:
+                self.gamemode = int(saved["gamemode"])
+            except (TypeError, ValueError):
+                pass
+        # A save file is not a protocol document: gamemode is broadcast to every other
+        # player (AddPlayerPacket, the ability bitmask) and written into StartGame.
+        if self.gamemode not in config.VALID_GAMEMODES:
+            self.gamemode = (
+                config.GAMEMODE if config.GAMEMODE in config.VALID_GAMEMODES else 0
+            )
+        if "allow_flight" in saved:
+            self.allow_flight = bool(saved["allow_flight"])
+        elif "gamemode" in saved:
+            # A world written before allow_flight existed: derive it rather than leave a
+            # restored creative player grounded.
+            self.allow_flight = self.gamemode in (1, 6)
+
     def to_dict(self):
         """Serialisable player state (UUID is the key the server stores it under)."""
         return {
@@ -386,22 +427,17 @@ class Session:
             if isinstance(data.get(attr), (int, float)):
                 setattr(self, attr, float(data[attr]))
         for attr in (
-            "gamemode",
             "experience",
             "experience_level",
             "selected_slot",
             "max_health",
-            "allow_flight",
         ):
             if attr in data:
                 try:
-                    setattr(
-                        self,
-                        attr,
-                        int(data[attr]) if attr != "allow_flight" else bool(data[attr]),
-                    )
+                    setattr(self, attr, int(data[attr]))
                 except (TypeError, ValueError):
                     pass
+        self.restore_gamemode(data)
         if isinstance(data.get("health"), (int, float)):
             self.health = max(0.0, min(self.max_health, float(data["health"])))
         inv = data.get("inventory")
@@ -1008,7 +1044,16 @@ class Session:
             elif status == 4:  # COMPLETED
                 self.state = "START_GAME"
                 log("Bedrock", "Resource pack negotiation COMPLETE")
-                sg = build_start_game(self.rid)
+                # StartGame announces the gamemode now, but the save is only applied at
+                # SetLocalPlayerAsInitialized. Restoring these two fields first keeps
+                # StartGame, UpdateAbilities and AddPlayer in agreement from the first
+                # packet instead of contradicting each other mid-login.
+                self.restore_gamemode(
+                    self.srv.player_storage.get(self.uuid)
+                    if self.srv.player_storage
+                    else None
+                )
+                sg = build_start_game(self.rid, self.gamemode)
                 dbg("World", "StartGame payload", sg)
                 self.send_packet(PID_START_GAME, sg)
                 log("World", "StartGame sent (%d bytes)" % len(sg))
@@ -1054,15 +1099,7 @@ class Session:
                         if tx is None:
                             continue
                         if tx_type == TX_USE_ITEM:
-                            # the client already predicted this placement locally
-                            self.predictions.predict(
-                                CONTAINER_INVENTORY,
-                                self.selected_slot,
-                                self._held_slot_item() or ITEM_AIR,
-                            )
-                            if not self.handle_use_item(tx):
-                                if tx["action"] == ACTION_CLICK_BLOCK:
-                                    self.try_place_block(tx)
+                            self.handle_item_use(tx, "transaction")
                         elif tx_type == TX_USE_ITEM_ON_ENTITY and tx["action"] == ACTION_ATTACK:
                             self.srv.handle_entity_attack(
                                 self,
@@ -1114,7 +1151,7 @@ class Session:
             self.send_packet(PID_UPDATE_ATTRIBUTES, build_update_attributes(self))
             # AddPlayer carries abilities too, but it only goes to *other* players, so the
             # joining player needs these explicitly - same as PocketMine's syncAbilities().
-            self.send_packet(PID_UPDATE_ABILITIES, build_update_abilities(self.rid))
+            self.sync_abilities()
             self.send_packet(PID_UPDATE_ADVENTURE_SETTINGS, build_update_adventure_settings())
             self.send_packet(PID_PLAYER_HOTBAR, build_player_hotbar(self.selected_slot))
             self.send_data()
@@ -1454,7 +1491,12 @@ class Session:
             if gliding is not None:
                 mismatch |= not self._toggle("gliding", gliding)
             if flying is not None:
+                was_flying = self.flying
                 mismatch |= not self._toggle("flying", flying, self.allow_flight)
+                if self.flying != was_flying:
+                    # UpdateAbilities is the only packet that carries the FLYING bit, so
+                    # without this the client keeps whatever was true when we spawned it.
+                    self.sync_abilities()
             if crawling is not None:
                 mismatch |= not self._toggle("crawling", crawling)
             if self.meta_dirty:
@@ -1506,9 +1548,7 @@ class Session:
                 self.stop_break(bpos)
         item_use = d.get("item_use")
         if item_use is not None:
-            self._trace_item_use(item_use)
-            if item_use["action"] == ACTION_CLICK_BLOCK:
-                self.try_place_block(item_use)
+            self.handle_item_use(item_use, "auth_input")
         stack_request = d.get("stack_request")
         if stack_request is not None:
             # A MINE_BLOCK request accompanies breaking. The drop is spawned as an item
@@ -1657,17 +1697,17 @@ class Session:
         self.play_sound_at(nx, ny, nz, block_sound(key, SOUND_PLACE), 0.7)
         return True
 
-    def _trace_item_use(self, tx):
-        """Log the first few item-use transactions: proves whether placement arrives at all."""
+    def _trace_item_use(self, tx, source="transaction"):
+        """Log the first few item-use transactions: proves which transport carries it."""
         if len(self.seen_item_use) >= 3:
             return
         self.seen_item_use.add(1)
-        item = tx.get("item") or {}
         declared = tx.get("block_runtime_id") or 0
         log(
             "Inventory",
-            "item-use action=%d face=%d clicked=%s runtimeId=%d (%s) held=%s"
+            "item-use via %s action=%d face=%d clicked=%s runtimeId=%d (%s) held=%s"
             % (
+                source,
                 tx.get("action", -1),
                 tx.get("face", -1),
                 tx.get("pos"),
@@ -1707,14 +1747,11 @@ class Session:
         if action != 0:
             return False
 
+        # What gets fired is decided from the server's own view of the held slot. The
+        # transaction's item id is only the client's claim, and trusting it lets a player
+        # release a bow they are not holding at all.
         held_item = self._held_slot_item()
-        tx_item = tx.get("item", {}) if isinstance(tx, dict) else {}
-        tx_item_id = tx_item.get("id") if isinstance(tx_item, dict) else None
-
-        held_id = held_item[0] if held_item else None
-        item_id = tx_item_id or held_id
-
-        if item_id not in BOW_IDS:
+        if held_item is None or held_item[0] not in BOW_IDS:
             return False
 
         is_creative = (
@@ -1723,24 +1760,14 @@ class Session:
             else False
         )
 
+        arrow_slot = None
         if not is_creative:
-            arrow_slot = None
             for slot_idx, itm in enumerate(self.inventory):
                 if itm and itm[0] in ARROW_IDS and itm[1] > 0:
                     arrow_slot = slot_idx
                     break
             if arrow_slot is None:
                 return False
-
-            aid, acnt, admg = self.inventory[arrow_slot]
-            if acnt <= 1:
-                self.inventory[arrow_slot] = ITEM_AIR
-            else:
-                self.inventory[arrow_slot] = (aid, acnt - 1, admg)
-            try:
-                self.sync_inventory_slots([arrow_slot])
-            except Exception:
-                pass
 
         pitch_rad = math.radians(self.pitch)
         yaw_rad = math.radians(self.yaw)
@@ -1751,44 +1778,100 @@ class Session:
 
         fx, fy, fz = self.feet()
         spawn_pos = (fx, fy + 1.62, fz)
+        spawned = False
         if hasattr(self.srv, "entity_mgr"):
             from ..entity.projectile import Arrow
 
-            self.srv.entity_mgr.spawn(
-                Arrow,
-                shooter_rid=self.rid,
-                pos=spawn_pos,
-                motion=(vx, vy, vz),
+            spawned = (
+                self.srv.entity_mgr.spawn(
+                    Arrow,
+                    shooter_rid=self.rid,
+                    pos=spawn_pos,
+                    motion=(vx, vy, vz),
+                )
+                is not None
             )
+
+        # Ammunition is spent only once the arrow actually exists: a plugin that vetoes
+        # EntitySpawnEvent refuses the shot, and a refused shot must not eat an arrow.
+        if spawned and arrow_slot is not None:
+            aid, acnt, admg = self.inventory[arrow_slot]
+            if acnt <= 1:
+                self.inventory[arrow_slot] = ITEM_AIR
+            else:
+                self.inventory[arrow_slot] = (aid, acnt - 1, admg)
+            try:
+                self.sync_inventory_slots([arrow_slot])
+            except Exception:
+                pass
+        return True
+
+    def handle_item_use(self, tx, source):
+        """Run one UseItemTransactionData, whichever transport reported it.
+
+        PlayerAuthInput embeds the same UseItemTransactionData in its payload
+        (ItemInteractionData, flag PERFORM_ITEM_INTERACTION) that other clients send as a
+        standalone InventoryTransaction, and pywer reads both. Whether a client uses one
+        or the other - or both for the same click - is not something the protocol
+        guarantees, so the first report runs the whole thing (prediction, the interact
+        hook, the item's own effect, block placement) and a second report of the same
+        click from the other transport within ITEM_USE_DEDUP_WINDOW reuses that verdict
+        instead of firing the event and consuming the item twice.
+
+        Returns True when the click was allowed to proceed.
+        """
+        action = tx.get("action", -1)
+        pos = tx.get("pos")
+        key = (action, tuple(pos) if pos is not None else None, tx.get("face"))
+        now = time.monotonic()
+        if (
+            source != self.last_item_use_source
+            and key == self.last_item_use_key
+            and (now - self.last_item_use_at) <= self.ITEM_USE_DEDUP_WINDOW
+        ):
+            return not self.last_item_use_cancelled
+        self._trace_item_use(tx, source)
+        # The client has already rendered this click locally; record what it expects so
+        # stack-id reconciliation compares against its own prediction, not ours.
+        self.predictions.predict(
+            CONTAINER_INVENTORY,
+            self.selected_slot,
+            self._held_slot_item() or ITEM_AIR,
+        )
+        ev = events.call(
+            PlayerInteractEvent(
+                self,
+                tx.get("item"),
+                action,
+                None if action == ACTION_CLICK_AIR else key[1],
+                tx.get("face"),
+            )
+        )
+        cancelled = bool(ev.is_cancelled)
+        self.last_item_use_key = key
+        self.last_item_use_source = source
+        self.last_item_use_at = now
+        self.last_item_use_cancelled = cancelled
+        if cancelled:
+            return False
+        if not self.handle_use_item(tx) and action == ACTION_CLICK_BLOCK:
+            self.try_place_block(tx)
         return True
 
     def handle_use_item(self, tx):
         """Handles UseItemTransactionData for projectiles like snowballs."""
         held_item = self._held_slot_item()
-        tx_item = tx.get("item", {}) if isinstance(tx, dict) else {}
-        tx_item_id = tx_item.get("id") if isinstance(tx_item, dict) else None
-
-        held_id = held_item[0] if held_item else None
-        item_id = tx_item_id or held_id
-
-        if item_id in SNOWBALL_IDS:
+        # Same rule as the bow release: the server decides what is being thrown from its
+        # own inventory, not from the item id the client put in the transaction.
+        if held_item is not None and held_item[0] in SNOWBALL_IDS:
             is_creative = (
                 self.gamemode_is_creative()
                 if hasattr(self, "gamemode_is_creative")
                 else False
             )
-            if not is_creative:
+            slot = None
+            if not is_creative and 0 <= self.selected_slot < len(self.inventory):
                 slot = self.selected_slot
-                if 0 <= slot < len(self.inventory):
-                    sid, scnt, sdmg = self.inventory[slot]
-                    if scnt <= 1:
-                        self.inventory[slot] = ITEM_AIR
-                    else:
-                        self.inventory[slot] = (sid, scnt - 1, sdmg)
-                    try:
-                        self.sync_inventory_slots([slot])
-                    except Exception:
-                        pass
 
             pitch_rad = math.radians(self.pitch)
             yaw_rad = math.radians(self.yaw)
@@ -1798,15 +1881,32 @@ class Session:
             vz = math.cos(yaw_rad) * math.cos(pitch_rad) * speed
             fx, fy, fz = self.feet()
             spawn_pos = (fx, fy + 1.62, fz)
+            spawned = False
             if hasattr(self.srv, "entity_mgr"):
                 from ..entity.projectile import Snowball
 
-                self.srv.entity_mgr.spawn(
-                    Snowball,
-                    shooter_rid=self.rid,
-                    pos=spawn_pos,
-                    motion=(vx, vy, vz),
+                spawned = (
+                    self.srv.entity_mgr.spawn(
+                        Snowball,
+                        shooter_rid=self.rid,
+                        pos=spawn_pos,
+                        motion=(vx, vy, vz),
+                    )
+                    is not None
                 )
+
+            # Same rule as the bow: the snowball is spent only once it really exists, so
+            # a plugin vetoing EntitySpawnEvent must not eat the stack.
+            if spawned and slot is not None:
+                sid, scnt, sdmg = self.inventory[slot]
+                if scnt <= 1:
+                    self.inventory[slot] = ITEM_AIR
+                else:
+                    self.inventory[slot] = (sid, scnt - 1, sdmg)
+                try:
+                    self.sync_inventory_slots([slot])
+                except Exception:
+                    pass
             return True
         return False
 
@@ -1875,8 +1975,18 @@ class Session:
             ),
         )
 
+    def _fire_block_interact(self, pos, block_key):
+        """Dispatch BlockInteractEvent. False means a plugin cancelled the click."""
+        ev = events.call(BlockInteractEvent(self, pos[0], pos[1], pos[2], block_key))
+        if ev.is_cancelled:
+            dbg("World", "%s's click on %s at %d,%d,%d was cancelled" % (self.name, block_key, pos[0], pos[1], pos[2]))
+            return False
+        return True
+
     def open_crafting_table(self, pos):
-        """Open a 3x3 workbench window at pos."""
+        """Open a 3x3 workbench window at pos. Returns False when a plugin cancelled it."""
+        if not self._fire_block_interact(pos, "crafting_table"):
+            return False
         if self.open_window:
             self.close_main_inventory(notify=False)
         self.open_window = True
@@ -1889,9 +1999,12 @@ class Session:
         )
         self.window_to_container[self.open_window_id] = CONTAINER_INVENTORY
         log("Inventory", "%s opened crafting table at %s (window %d)" % (self.name, pos, self.open_window_id))
+        return True
 
     def open_chest(self, pos):
-        """Open a 27-slot chest container window at pos."""
+        """Open a 27-slot chest container window at pos. Returns False when cancelled."""
+        if not self._fire_block_interact(pos, "chest"):
+            return False
         if self.open_window:
             self.close_main_inventory(notify=False)
         self.open_window = True
@@ -1909,6 +2022,7 @@ class Session:
             build_inventory_content(self.open_window_id, chest_items, container_id=self.open_window_id),
         )
         log("Inventory", "%s opened chest at %s (window %d)" % (self.name, pos, self.open_window_id))
+        return True
 
     def close_main_inventory(self, notify=True):
         if not self.open_window:
@@ -2004,6 +2118,21 @@ class Session:
             return
         if action == BA_START_BREAK:
             self.start_break(pos, face)
+        elif action in (BA_CONTINUE_DESTROY_BLOCK, BA_CRACK_BREAK):
+            # Same heartbeat the PlayerAuthInput path gives: without it a legacy client
+            # starts the break and the server timer never sees another input, so the
+            # block never finishes breaking.
+            self.continue_break(pos, face)
+        elif action == BA_PREDICT_DESTROY_BLOCK:
+            # The client's guess that the block is gone. The server owns the timing
+            # (serverAuthoritativeBlockBreaking), so acting on it would destroy the block
+            # long before hardness*5 elapsed - logged instead of honoured.
+            if self.break_target == tuple(pos):
+                dbg(
+                    "World",
+                    "client predicted destroy at %.0f%%, waiting for the server timer"
+                    % (self.break_progress * 100),
+                )
         elif action in (BA_ABORT_BREAK, BA_STOP_BREAK):
             self.stop_break(pos)
 
@@ -2047,6 +2176,24 @@ class Session:
 
     def gamemode_is_creative(self):
         return self.gamemode in (1, 6)
+
+    def sync_abilities(self):
+        """Send UpdateAbilitiesPacket built from *this* session's state.
+
+        gamemode, flying and allow_flight are all per-player (allow_flight is restored
+        from the save, gamemode too), so taking any of them from the server default would
+        tell a restored creative player it is in survival, or a player who is currently
+        flying that it is not.
+        """
+        self.send_packet(
+            PID_UPDATE_ABILITIES,
+            build_update_abilities(
+                self.rid,
+                gamemode=self.gamemode,
+                flying=self.flying,
+                allow_flight=self.allow_flight,
+            ),
+        )
 
     def head_in_water(self):
         return (

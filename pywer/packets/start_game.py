@@ -10,12 +10,22 @@ from ..data.item_table import ITEM_TABLE
 from ..world.terrain import SPAWN
 
 
-def build_start_game(runtime_id):
-    """Field order follows BedrockProtocol StartGamePacket for 1.21.50."""
+def build_start_game(runtime_id, gamemode=None):
+    """Field order follows BedrockProtocol StartGamePacket for 1.21.50.
+
+    `gamemode` is the *player's* game type; the LevelSettings game type below stays on
+    config.GAMEMODE because that is the world default. Both are validated: a value the
+    protocol does not define must not be written into a packet.
+    """
     w = ByteWriter()
+    world_gamemode = config.GAMEMODE if config.GAMEMODE in config.VALID_GAMEMODES else 0
+    if gamemode is None:
+        gamemode = world_gamemode
+    if gamemode not in config.VALID_GAMEMODES:
+        gamemode = 0
     w.write_varint64(runtime_id)  # actorUniqueId
     w.write_varuint64(runtime_id)  # actorRuntimeId
-    w.write_varint32(config.GAMEMODE)  # player gamemode
+    w.write_varint32(gamemode)  # player gamemode
     for v in (SPAWN[0] + 0.5, SPAWN[1] + 1.62, SPAWN[2] + 0.5):
         w.write_float(v)
     w.write_float(0.0)
@@ -27,7 +37,7 @@ def build_start_game(runtime_id):
     w.write_string("")
     w.write_varint32(0)  # SpawnSettings: biomeType, biomeName, dimension(overworld)
     w.write_varint32(1)  # generator (infinite)
-    w.write_varint32(config.GAMEMODE)  # world gamemode
+    w.write_varint32(world_gamemode)  # world gamemode
     w.write_bool(False)  # hardcore
     w.write_varint32(1)  # difficulty
     w.write_varint32(SPAWN[0])

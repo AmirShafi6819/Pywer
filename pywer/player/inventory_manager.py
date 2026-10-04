@@ -3,6 +3,8 @@
 
 from .inventory import item_tuple, MAX_STACK
 from .recipes import match_recipe
+from ..event import PlayerDropItemEvent
+from ..event import manager as events
 from ..world.blocks import item_key_for_id
 
 # ItemStackRequestAction types (BedrockProtocol ItemStackRequestActionType)
@@ -105,6 +107,11 @@ class InventoryManager:
         key = item_key_for_id(item[0])
         if key is None:
             raise InventoryError("unknown item")
+        # Dispatched before anything is moved, so a cancelled drop leaves the slot exactly
+        # as it was and the rejected request makes the client resynchronise.
+        ev = events.call(PlayerDropItemEvent(self.session, (item[0], count, item[2])))
+        if ev.is_cancelled:
+            raise InventoryError("drop cancelled by plugin")
         if not self.session.srv.drop_item(self.session.feet(), key, count):
             raise InventoryError("cannot drop item")
         lst[i] = item_tuple(item[0], item[1] - count, item[2])

@@ -9,6 +9,8 @@ import random
 import time
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Type
 
+from ..event import EntityDespawnEvent, EntitySpawnEvent
+from ..event import manager as events
 from .base import Entity
 from .item import ItemEntity, MERGE_RANGE, PICKUP_DELAY
 
@@ -31,13 +33,21 @@ class EntityManager:
         self._local_rid += 1
         return self._local_rid
 
-    def spawn(self, entity_cls: Type[Entity], *args: Any, **kwargs: Any) -> Entity:
-        """Spawns an entity, adds it to the spatial index, and broadcasts spawn packet."""
+    def spawn(self, entity_cls: Type[Entity], *args: Any, **kwargs: Any) -> Optional[Entity]:
+        """Spawns an entity, adds it to the spatial index, and broadcasts spawn packet.
+
+        Returns None when a plugin cancelled the EntitySpawnEvent. Callers that ignore
+        the return value therefore spawn nothing rather than a half-registered entity:
+        the rid is allocated first, and an allocated-but-unused id is harmless.
+        """
         rid = kwargs.pop("rid", None)
         if rid is None:
             rid = self.alloc_rid()
 
         entity = entity_cls(self.srv, rid, *args, **kwargs)
+        ev = events.call(EntitySpawnEvent(entity, entity.pos))
+        if ev.is_cancelled:
+            return None
         self.entities[rid] = entity
         chunk = entity.chunk
         if chunk not in self.chunk_index:
@@ -91,6 +101,10 @@ class EntityManager:
                 self.chunk_index[chunk].discard(entity)
                 if not self.chunk_index[chunk]:
                     del self.chunk_index[chunk]
+
+            # Fired once the entity is out of every index, so a handler that queries the
+            # manager sees the same state the rest of the server already sees.
+            events.call(EntityDespawnEvent(entity))
 
             if hasattr(self.srv, "broadcast"):
                 try:
@@ -187,15 +201,19 @@ class EntityManager:
             0.2,
             random.random() * 0.2 - 0.1,
         )
-        self.spawn(
-            ItemEntity,
-            item_key,
-            count,
-            pos=(px, py, pz),
-            motion=rand_motion,
-            spawned_at=now,
+        # False when a plugin cancelled the spawn: the caller must not treat a refusal
+        # as a successful drop.
+        return (
+            self.spawn(
+                ItemEntity,
+                item_key,
+                count,
+                pos=(px, py, pz),
+                motion=rand_motion,
+                spawned_at=now,
+            )
+            is not None
         )
-        return True
 
     def tick(
         self, now: float, dt: float, world_is_solid: Callable[[int, int, int], bool]
