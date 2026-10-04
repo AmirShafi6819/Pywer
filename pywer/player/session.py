@@ -12,6 +12,7 @@ from .. import config
 from ..crypto.bedrock import BedrockCipher
 from ..crypto.ec import ecdh, pub_to_spki, spki_to_pub
 from ..crypto.jwt import jwt_make_es384
+from ..entity.manager import resolve_actor
 from ..event import (
     BlockBreakEvent,
     BlockPlaceEvent,
@@ -1245,24 +1246,35 @@ class Session:
         """
         self.send_packet(PID_UPDATE_ATTRIBUTES, build_update_attributes(self))
 
-    def damage(self, amount, attacker=None, source_rid=None, cause="entity_attack"):
+    def damage(self, amount, attacker=None, source_rid=None, cause=None):
         """Entity::attack / EntityDamageEvent pipeline for players.
 
         `source_rid` is the keyword Projectiles use; it resolves back to the shooting
-        session so an arrow hit carries the same knockback and event damager as a melee
-        hit. Without it a projectile landing on a player raised TypeError straight out
-        of EntityManager.tick and took the whole tick loop with it.
+        actor - player *or* mob - so a skeleton's arrow carries the same damager,
+        knockback and death message as a melee hit. Without it a projectile landing on
+        a player raised TypeError straight out of EntityManager.tick and took the whole
+        tick loop with it.
+
+        `cause` defaults from what actually hit us rather than always claiming
+        "entity_attack": a void or environmental hit that passes through here would
+        otherwise tell plugins it was a mob.
         """
         if self.dead or self.hurt_time > 0:
             return False
         amount = float(amount)
-        if amount <= 0.0:
+        # Zero is a real impact - a snowball or an egg does no damage but must still
+        # fire the event, play the hurt animation and knock the target back. Only a
+        # negative amount is meaningless.
+        if amount < 0.0:
             return False
-        if attacker is None and source_rid is not None and hasattr(self.srv, "playing"):
-            for s in self.srv.playing():
-                if s.rid == source_rid:
-                    attacker = s
-                    break
+        if attacker is None and source_rid is not None:
+            attacker = resolve_actor(self.srv, source_rid)
+        if cause is None:
+            cause = (
+                "entity_attack"
+                if (attacker is not None or source_rid is not None)
+                else "generic"
+            )
         if attacker is not None:
             ev = EntityDamageByEntityEvent(self, attacker, amount, cause)
         else:
@@ -1271,7 +1283,7 @@ class Session:
         if ev.is_cancelled:
             return False
         amount = float(ev.amount)
-        if amount <= 0.0:
+        if amount < 0.0:
             return False
         self.health = max(0.0, self.health - amount)
         self.hurt_time = 10
@@ -1306,7 +1318,22 @@ class Session:
         if ev.death_message:
             self.srv.broadcast([self._pk(PID_TEXT, build_text(0, "", ev.death_message))])
         respawn_pos = (SPAWN[0] + 0.5, SPAWN[1] + 1.0, SPAWN[2] + 0.5)
-        self.teleport(*respawn_pos)
+        # Dispatched before the teleport, not after it: the whole point of this event is
+        # to let a plugin redirect the respawn (bed, lobby, arena), and firing it once
+        # the player was already moved - with the return value thrown away - meant the
+        # only spawn-point hook could never choose anything. A malformed rewrite falls
+        # back to the world spawn instead of teleporting the player into garbage.
+        ev = events.call(PlayerRespawnEvent(self, respawn_pos))
+        pos = getattr(ev, "respawn_pos", None)
+        if not (
+            isinstance(pos, (list, tuple))
+            and len(pos) == 3
+            and all(isinstance(v, (int, float)) for v in pos)
+        ):
+            pos = respawn_pos
+        else:
+            pos = (float(pos[0]), float(pos[1]), float(pos[2]))
+        self.teleport(*pos)
         self.health = self.max_health
         self.hurt_time = 0
         self.fall_distance = 0.0
@@ -1314,10 +1341,9 @@ class Session:
         self.dead = False
         self.sync_attributes()
         self.send_data()
-        events.call(PlayerRespawnEvent(self, respawn_pos))
         log(
             "Player",
-            "%s died (killed by %s), respawned at %s" % (self.name, killer_name, respawn_pos),
+            "%s died (killed by %s), respawned at %s" % (self.name, killer_name, pos),
         )
 
     def send_data(self, to_all=False):

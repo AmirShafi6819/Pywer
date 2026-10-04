@@ -13,6 +13,32 @@ from .base import Entity
 from .item import ItemEntity, MERGE_RANGE, PICKUP_DELAY
 
 
+def resolve_actor(srv: Any, rid: Any) -> Any:
+    """Resolve a network actor id to a player session or a world entity.
+
+    Players live in `srv.playing()`, mobs/items/projectiles live in
+    `srv.entity_mgr.entities`. Searching only one of the two collections makes every
+    RID lookup wrong for the other half of the world: a punch at a zombie found no
+    target and was silently dropped, and an arrow shot by a skeleton could not be
+    attributed to its shooter, so it produced no damager, no knockback and a death
+    message that read "died" instead of "slain by skeleton".
+
+    Players are checked first so an id collision (there is none by construction, but
+    a player is the more specific answer) never shadows a session.
+    """
+    if rid is None:
+        return None
+    playing = getattr(srv, "playing", None)
+    if callable(playing):
+        for actor in playing():
+            if getattr(actor, "rid", None) == rid:
+                return actor
+    entities = getattr(getattr(srv, "entity_mgr", None), "entities", None)
+    if isinstance(entities, dict):
+        return entities.get(rid)
+    return None
+
+
 class EntityManager:
     """Manages all world entities with spatial chunk indexing and distance culling."""
 
