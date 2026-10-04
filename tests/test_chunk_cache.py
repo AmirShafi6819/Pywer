@@ -28,6 +28,27 @@ class TestChunkCache(unittest.TestCase):
         cache.clear()
         self.assertEqual(len(cache), 0)
 
+    def test_invalidate_block_floors_negative_coordinates(self):
+        # int(-0.5) == 0 truncates towards zero, which would evict chunk 0 instead of
+        # the chunk the block actually lives in (-1).
+        cache = ChunkCache()
+        cache.put(-1, -1, b"neg")
+        cache.put(0, 0, b"zero")
+
+        cache.invalidate_block(-0.5, -0.5)
+
+        self.assertIsNone(cache.get(-1, -1))
+        self.assertEqual(cache.get(0, 0), b"zero")
+
+    def test_invalidate_block_accepts_integer_coordinates(self):
+        cache = ChunkCache()
+        cache.put(-1, 2, b"neg")
+        cache.invalidate_block(-16, 33)
+        self.assertIsNone(cache.get(-1, 2))
+        cache.put(-1, 2, b"neg")
+        cache.invalidate_block(-1, 33)
+        self.assertIsNone(cache.get(-1, 2))
+
 
 if __name__ == "__main__":
     unittest.main()

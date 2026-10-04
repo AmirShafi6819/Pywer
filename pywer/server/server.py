@@ -8,7 +8,7 @@ import socket
 import struct
 import time
 
-from .. import config
+from .. import config, __version__
 from ..storage import WorldStorage, PlayerStorage, SAVE_INTERVAL
 from ..log import log, dbg
 from ..util.serializer import ByteReader, ByteWriter
@@ -43,7 +43,7 @@ from ..player.movement import NETWORK_EYE_OFFSET
 from ..player.session import Session
 from ..event import manager as events, PlayerJoinEvent, PlayerQuitEvent, ServerLoadEvent, ServerStopEvent
 from .worker import WorkerPool
-from ..entity.manager import EntityManager
+from ..entity.manager import EntityManager, resolve_actor
 from ..world.cache import ChunkCache
 from ..scheduler import ServerScheduler
 from ..command import CommandManager, CommandSender, PlayerCommandSender, ConsoleCommandSender
@@ -51,6 +51,40 @@ from ..plugin import PluginManager
 
 TICK_INTERVAL = 0.05
 MAX_CATCHUP_TICKS = 5
+
+# Server-list game mode label. Kept in sync with config.GAMEMODE so the ping response
+# and the advertised game mode cannot drift apart.
+GAMEMODE_NAMES = {
+    0: "Survival",
+    1: "Creative",
+    2: "Adventure",
+    3: "Spectator",
+    5: "Survival",
+    6: "Creative",
+}
+
+
+def build_motd(guid, port, online=0):
+    """Unconnected ping response.
+
+    Every advertised value comes from its own source of truth instead of a literal:
+    the game mode from config.GAMEMODE, the player limit from config.MAX_PLAYERS, the
+    version from pywer.__version__, and the online count from the caller so the server
+    list can never disagree with what the server is actually running or hosting.
+    """
+    mode = config.GAMEMODE & 0x7
+    return "MCPE;pywer-v%s;%d;%s;%d;%d;%d;Minimal;%s;%d;%d;%d;" % (
+        __version__,
+        config.PROTOCOL,
+        config.GAME_VERSION,
+        max(0, int(online)),
+        max(0, int(config.MAX_PLAYERS)),
+        guid,
+        GAMEMODE_NAMES.get(mode, "Survival"),
+        mode,
+        port,
+        port + 1,
+    )
 
 
 class Server:
@@ -89,18 +123,15 @@ class Server:
         self.plugin_data_dir = self.plugins_dir / "data"
         self.plugin_mgr = PluginManager(self, self.plugins_dir, self.plugin_data_dir)
         self.plugin_manager = self.plugin_mgr
+        self._stopped = False
+        self._next_tick = time.perf_counter() + TICK_INTERVAL
+        # The world must exist before plugins are enabled: an on_enable implementation is
+        # allowed to read the level, and ServerLoadEvent is only meaningful once the level
+        # has been loaded.
         self.plugin_mgr.load_all_plugins()
+        self.load_world()
         self.plugin_mgr.enable_all()
         self.event_mgr.call(ServerLoadEvent(self))
-        self._next_tick = time.perf_counter() + TICK_INTERVAL
-        self.load_world()
-        self.motd = "MCPE;pywer-v0.9.1dev;%d;%s;0;1;%d;Minimal;Creative;1;%d;%d;" % (
-            config.PROTOCOL,
-            config.GAME_VERSION,
-            self.guid,
-            port,
-            port + 1,
-        )
 
     def send(self, data, addr):
         """UDP send that survives a full kernel send buffer."""
@@ -163,7 +194,9 @@ class Server:
             self.player_storage.put(p.uuid, p.to_dict())
         self.player_storage.save(force=force)
         self._last_save = time.time()
-        self._window_id = CONTAINER_ID_FIRST
+        # Note: the window-id counter is deliberately not reset here. Autosave runs while
+        # containers may still be open, and rewinding the counter would let the next
+        # container reuse a window id that is already in flight.
 
     def save_player(self, p):
         self.player_storage.put(p.uuid, p.to_dict())
@@ -183,7 +216,9 @@ class Server:
         pid = data[0]
         if pid in (0x01, 0x02):
             t = data[1:9]
-            ms = self.motd.encode()
+            # Built per ping: the online count has to track the live session table, and
+            # a string frozen in __init__ advertised "0 players" for the rest of the run.
+            ms = build_motd(self.guid, self.port, len(self.sessions)).encode()
             self.send(
                 b"\x1c" + t + struct.pack(">Q", self.guid) + RAKNET_MAGIC + struct.pack(">H", len(ms)) + ms,
                 addr,
@@ -226,13 +261,14 @@ class Server:
                 log("Player", "send error: %r" % e)
 
     def handle_entity_attack(self, attacker, target_rid, player_pos, click_pos):
-        """PocketMine Player::attackEntity-style validation for player-vs-player hits."""
-        target = None
-        for s in self.playing():
-            if s.rid == target_rid:
-                target = s
-                break
-        if target is None or target is attacker or target.dead:
+        """PocketMine Player::attackEntity-style validation for melee hits.
+
+        The target may be another player or any world entity - `playing()` only holds
+        sessions, so a punch at a zombie used to resolve to nothing and the whole attack
+        (swing, damage, hurt animation) was dropped before anything happened.
+        """
+        target = resolve_actor(self, target_rid)
+        if target is None or target is attacker or getattr(target, "dead", False):
             return False
         if attacker.attack_time > 0:
             return False
@@ -246,6 +282,9 @@ class Server:
         if sum((player_pos[i] - (af[i] + (0.0 if i != 1 else NETWORK_EYE_OFFSET))) ** 2 for i in range(3)) > 4.0:
             return False
         attacker.attack_time = 10
+        # Inbound AnimatePacket is not relayed, so without this other players never saw
+        # the swing of a hit - only the miss path (F_MISSED_SWING) animated anything.
+        attacker.broadcast_arm_swing()
         target.damage(1.0, attacker)
         return True
 
@@ -474,17 +513,36 @@ class Server:
             self.step()
 
     def stop(self):
-        """Cleanly shut down plugins, scheduler, worker pool, save world, and close socket."""
-        try:
-            self.event_mgr.call(ServerStopEvent())
-        except Exception:
-            pass
-        if hasattr(self, "plugin_mgr"):
-            self.plugin_mgr.disable_all()
-        self.scheduler.shutdown()
-        self.save_all(force=True)
-        self.worker_pool.shutdown()
-        try:
-            self.sock.close()
-        except OSError:
-            pass
+        """Shut down plugins, scheduler, workers, persist the world and close the socket.
+
+        Idempotent and failure-isolated: every step is guarded so that one subsystem
+        failing to shut down still releases the others, and a second call is a no-op.
+        Tolerates a partially constructed server so a failure during __init__ can still
+        release what was already acquired.
+        """
+        if getattr(self, "_stopped", False):
+            return
+        self._stopped = True
+
+        def _persist():
+            self.save_all(force=True)
+            log("Storage", "saved world and player data")
+
+        steps = (
+            ("ServerStopEvent", lambda: self.event_mgr.call(ServerStopEvent(self))),
+            ("plugins", lambda: self.plugin_mgr.disable_all()),
+            ("scheduler", self.scheduler.shutdown),
+            ("storage", _persist),
+            ("workers", self.worker_pool.shutdown),
+        )
+        for name, step in steps:
+            try:
+                step()
+            except Exception as e:
+                log("Server", "%s shutdown failed: %r" % (name, e))
+        sock = getattr(self, "sock", None)
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass

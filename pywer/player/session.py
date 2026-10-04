@@ -12,13 +12,18 @@ from .. import config
 from ..crypto.bedrock import BedrockCipher
 from ..crypto.ec import ecdh, pub_to_spki, spki_to_pub
 from ..crypto.jwt import jwt_make_es384
+from ..entity.manager import resolve_actor
 from ..event import (
     BlockBreakEvent,
     BlockInteractEvent,
     BlockPlaceEvent,
+    EntityDamageByEntityEvent,
+    EntityDamageEvent,
     PlayerChatEvent,
     PlayerCommandPreprocessEvent,
+    PlayerDeathEvent,
     PlayerInteractEvent,
+    PlayerRespawnEvent,
 )
 from ..event import manager as events
 from ..log import dbg, log
@@ -231,6 +236,44 @@ def _build_chunk_job(cx, cz):
 
 class Session:
     RESEND_AFTER = 1.0
+    RESEND_BACKOFF = 1.5  # per-retry multiplier
+    RESEND_BACKOFF_MAX = 4.0  # ceiling for that delay
+    MAX_RETRIES = 10  # a datagram this old means the reliable channel is unusable
+    RESENDS_PER_TICK = 32  # spread an expired window instead of re-blasting it at once
+    # Transport resource ceilings. RakNet sequences are 24-bit and the counters are
+    # extended monotonically in memory, so these only bound how much state a single
+    # peer is allowed to make us hold before we treat it as dead.
+    # MAX_PENDING is deliberately generous: a spawn burst of chunk packets legitimately
+    # puts hundreds of datagrams in flight before the first ACK can round-trip, so the
+    # backlog alone never proves anything. It is only the threshold at which we start
+    # looking for ACK silence (ACK_STALL_TIMEOUT) before declaring the peer dead.
+    MAX_PENDING = 4096
+    ACK_STALL_TIMEOUT = 10.0
+    MAX_QUEUE = 1024
+    MAX_GAP = 1024
+    MAX_ORDER_WINDOW = 4096
+    MAX_SPLITS = 64
+    MAX_SPLIT_PARTS = 8192
+    SPLIT_TTL = 10.0
+    MAX_ACK_RANGE = 4096  # sequences one range record may expand to
+
+    @staticmethod
+    def _extend_seq(wire, ref):
+        """Map a 24-bit wire sequence onto the monotonic sequence of *ref*.
+
+        Both directions use 24-bit counters on the wire. Keeping a monotonic
+        counter in memory and re-deriving the window here is what keeps duplicate
+        detection, gap detection and retransmission correct across the wrap.
+        """
+        if ref is None or ref < 0:
+            return wire
+        cand = (ref & ~0xFFFFFF) | wire
+        if cand > ref + 0x800000:
+            cand -= 0x1000000
+        elif cand + 0x800000 < ref:
+            cand += 0x1000000
+        return cand
+
     # A client reports one click twice - once in PlayerAuthInput's embedded
     # ItemInteractionData and once as a standalone InventoryTransaction - and which of the
     # two (or whether both) actually arrives differs per client. Two reports of the same
@@ -248,6 +291,7 @@ class Session:
         self.nack_q = []
         self.max_seq = -1
         self.seen_rel = set()
+        self.max_rel = -1
         self.order_next = {}
         self.order_buf = {}
         self.splits = {}
@@ -257,6 +301,7 @@ class Session:
         self.split_id = 0
         self.pending = {}
         self.last_rx = time.time()
+        self.last_ack_at = time.time()
         self.compress = False
         self.cipher = None
         self.player = None
@@ -682,16 +727,55 @@ class Session:
     def _udp(self, data):
         return self.srv.send(data, self.addr)
 
+    def _datagram_bytes(self, seq, frames):
+        return b"\x84" + (seq & 0xFFFFFF).to_bytes(3, "little") + b"".join(frames)
+
     def _send_datagram(self, frames):
         seq = self.send_seq
         self.send_seq += 1
         # Keep the datagram in pending even when the send fails: tick() resends it.
-        if not self._udp(b"\x84" + seq.to_bytes(3, "little") + b"".join(frames)):
+        if not self._udp(self._datagram_bytes(seq, frames)):
             dbg("RakNet", "datagram %d not sent, will retry" % seq)
-        self.pending[seq] = (time.time(), frames)
+        self.pending[seq] = (time.time(), frames, 0)
+
+    def _resend_datagram(self, seq, ent, now=None):
+        """Retransmit *seq* under its original sequence number.
+
+        Reusing the wire sequence is what lets the receiver fill the exact gap it
+        reported; minting a new one leaves the original gap permanently open.
+
+        `ent` is the pending entry, so the retry counter survives across retransmits and
+        `tick()` can back the next attempt off instead of re-blasting on a fixed timer.
+        """
+        frames = ent[1]
+        retries = (ent[2] if len(ent) > 2 else 0) + 1
+        if not self._udp(self._datagram_bytes(seq, frames)):
+            dbg("RakNet", "retransmit %d not sent, will retry" % seq)
+        self.pending[seq] = (now if now is not None else time.time(), frames, retries)
+
+    def _close_for(self, reason):
+        dbg("RakNet", "closing %s: %s" % (self.addr, reason))
+        self.state = "CLOSED"
 
     def send_rak(self, payload):
         """Reliable-ordered, channel 0, with splitting."""
+        if self.state == "CLOSED":
+            return
+        # A spawn burst of chunk packets legitimately fills the window before the first
+        # ACK can round-trip (a few dozen chunks is hundreds of datagrams, and on a
+        # 150-250ms link the ACKs are still in flight for several ticks), so the backlog
+        # on its own is not evidence of anything. Only a peer that keeps talking while
+        # never acknowledging again is broken or hostile, and that is what the
+        # ACK-silence check is here to detect.
+        if (
+            len(self.pending) >= self.MAX_PENDING
+            and time.time() - self.last_ack_at > self.ACK_STALL_TIMEOUT
+        ):
+            self._close_for(
+                "peer stopped acknowledging (%d unsilenced datagrams)"
+                % len(self.pending)
+            )
+            return
         maxp = self.mtu - 28 - 4 - 24
         chunks = [payload[i : i + maxp] for i in range(0, len(payload), maxp)] or [b""]
         oi = self.ord_idx
@@ -702,9 +786,9 @@ class Session:
         for i, c in enumerate(chunks):
             sp = len(chunks) > 1
             f = bytes([(3 << 5) | (0x10 if sp else 0)]) + struct.pack(">H", len(c) * 8)
-            f += self.rel_idx.to_bytes(3, "little")
+            f += (self.rel_idx & 0xFFFFFF).to_bytes(3, "little")
             self.rel_idx += 1
-            f += oi.to_bytes(3, "little") + b"\x00"
+            f += (oi & 0xFFFFFF).to_bytes(3, "little") + b"\x00"
             if sp:
                 f += struct.pack(">IHI", len(chunks), sid, i)
             frames.append(f + c)
@@ -750,20 +834,25 @@ class Session:
     # ---- receive
     def on_datagram(self, data):
         self.last_rx = time.time()
-        flags = data[0]
-        if flags & 0x40:
+        if self.state == "CLOSED":
+            return
+        kind = data[0] & 0xE0
+        if kind == 0xA0:  # RakNet ID_ACK
             return self._on_ack(data)
-        if flags & 0x20:
+        if kind == 0xC0:  # RakNet ID_NACK
             return self._on_nack(data)
         r = ByteReader(data, 1)
-        seq = r.read_u24_le()
+        seq = self._extend_seq(r.read_u24_le(), self.max_seq)
+        if len(self.ack_q) < self.MAX_QUEUE:
+            self.ack_q.append(seq)
         if seq in self.seen_seq:
             return
         self.seen_seq.add(seq)
-        self.ack_q.append(seq)
-        for s in range(self.max_seq + 1, seq):
-            if s not in self.seen_seq:
-                self.nack_q.append(s)
+        if seq > self.max_seq + 1:
+            start = max(self.max_seq + 1, seq - self.MAX_GAP)
+            for s in range(start, seq):
+                if s not in self.seen_seq and len(self.nack_q) < self.MAX_QUEUE:
+                    self.nack_q.append(s)
         self.max_seq = max(self.max_seq, seq)
         if len(self.seen_seq) > 8192:
             self.seen_seq = set(
@@ -787,16 +876,30 @@ class Session:
                 sp = (r.read_u32_be(), r.read_u16_be(), r.read_u32_be())
             payload = r.read_bytes(ln)
             if ridx is not None:
+                ridx = self._extend_seq(ridx, self.max_rel)
                 if ridx in self.seen_rel:
                     continue
                 self.seen_rel.add(ridx)
+                if ridx > self.max_rel:
+                    self.max_rel = ridx
                 if len(self.seen_rel) > 8192:
                     self.seen_rel = set(
-                        x for x in self.seen_rel if x > ridx - 4096
+                        x for x in self.seen_rel if x > self.max_rel - 4096
                     )
             if sp:
                 cnt, sid, idx = sp
-                ent = self.splits.setdefault(sid, {"cnt": cnt, "parts": {}})
+                if cnt == 0 or cnt > self.MAX_SPLIT_PARTS or idx >= cnt:
+                    self._close_for("invalid split frame (cnt=%d idx=%d)" % (cnt, idx))
+                    return
+                if sid not in self.splits and len(self.splits) >= self.MAX_SPLITS:
+                    self._close_for("too many concurrent splits (%d)" % len(self.splits))
+                    return
+                ent = self.splits.setdefault(
+                    sid, {"cnt": cnt, "parts": {}, "t": time.time()}
+                )
+                if ent["cnt"] != cnt:
+                    self._close_for("split %d changed part count" % sid)
+                    return
                 ent["parts"][idx] = payload
                 if len(ent["parts"]) < ent["cnt"]:
                     continue
@@ -805,10 +908,14 @@ class Session:
                 )
                 del self.splits[sid]
             if oidx is not None and rel in (3, 7):
+                oidx = self._extend_seq(oidx, self.order_next.get(ch, -1))
                 nxt = self.order_next.get(ch, 0)
                 buf = self.order_buf.setdefault(ch, {})
                 if oidx < nxt:
                     continue
+                if oidx - nxt > self.MAX_ORDER_WINDOW:
+                    self._close_for("ordering window overflow on channel %d" % ch)
+                    return
                 buf[oidx] = payload
                 while nxt in buf:
                     self.on_rak_payload(buf.pop(nxt))
@@ -821,24 +928,39 @@ class Session:
         r = ByteReader(data, 1)
         n = r.read_u16_be()
         out = []
+        cap = Session.MAX_ACK_RANGE
         for _ in range(n):
             if r.read_u8():
                 out.append(r.read_u24_le())
             else:
                 a = r.read_u24_le()
                 b = r.read_u24_le()
-                out.extend(range(a, min(b, a + 4096) + 1))
+                if b < a:
+                    # The range straddles the 24-bit wrap: the sender counted past
+                    # 0xFFFFFF and back to 0. range(a, b + 1) is empty there, so every
+                    # ack in it was silently discarded and the peer retransmitted the
+                    # whole window for nothing. Emit both halves, capped so a hostile
+                    # range cannot materialise 16M entries.
+                    head = min(0x1000000 - a, cap)
+                    out.extend(range(a, a + head))
+                    out.extend(range(0, min(b + 1, cap - head)))
+                else:
+                    out.extend(range(a, min(b, a + cap - 1) + 1))
         return out
 
     def _on_ack(self, data):
-        for s in self._records(data):
-            self.pending.pop(s, None)
+        # Any ACK at all proves the peer is still acknowledging, which is what the
+        # stalled-window check in send_rak keys off.
+        self.last_ack_at = time.time()
+        for wire in self._records(data):
+            self.pending.pop(self._extend_seq(wire, self.send_seq), None)
 
     def _on_nack(self, data):
-        for s in self._records(data):
-            ent = self.pending.pop(s, None)
+        for wire in self._records(data):
+            seq = self._extend_seq(wire, self.send_seq)
+            ent = self.pending.get(seq)
             if ent:
-                self._send_datagram(ent[1])
+                self._resend_datagram(seq, ent)
 
     def tick(self, now):
         if self.spawned:
@@ -852,21 +974,55 @@ class Session:
                 self.attack_time -= 1
             if self.hurt_time > 0:
                 self.hurt_time -= 1
+        # RakNet: 0xA0 acknowledges, 0xC0 reports a gap the sender must fill.
         if self.ack_q:
-            self._udp(self._ackpkt(0xC0, self.ack_q))
+            for pk in self._ackpkts(0xA0, self.ack_q):
+                self._udp(pk)
             self.ack_q = []
         if self.nack_q:
-            self._udp(self._ackpkt(0xA0, self.nack_q))
+            for pk in self._ackpkts(0xC0, self.nack_q):
+                self._udp(pk)
             self.nack_q = []
-        for s, (t, frames) in list(self.pending.items()):
-            if now - t > self.RESEND_AFTER:
-                del self.pending[s]
-                dbg("RakNet", "resend seq %d" % s)
-                self._send_datagram(frames)
+        # Expiring entries are retried on a per-packet backoff and capped per tick: a
+        # burst that all went out at the same instant would otherwise all come due at
+        # the same instant too, and re-transmit as one storm straight into a link that
+        # is already struggling.
+        resends = 0
+        for s, ent in list(self.pending.items()):
+            t, retries = ent[0], ent[2]
+            delay = min(
+                self.RESEND_AFTER * (self.RESEND_BACKOFF ** retries),
+                self.RESEND_BACKOFF_MAX,
+            )
+            if now - t <= delay:
+                continue
+            if retries >= self.MAX_RETRIES:
+                self._close_for(
+                    "datagram %d still unacknowledged after %d retries" % (s, retries)
+                )
+                return
+            if resends >= self.RESENDS_PER_TICK:
+                break
+            resends += 1
+            dbg("RakNet", "resend seq %d (attempt %d)" % (s, retries + 1))
+            self._resend_datagram(s, ent, now)
+        if self.splits:
+            for sid in [
+                sid for sid, e in self.splits.items() if now - e["t"] > self.SPLIT_TTL
+            ]:
+                del self.splits[sid]
 
-    @staticmethod
-    def _ackpkt(pid, seqs):
-        seqs = sorted(set(seqs))
+    def _ackpkts(self, pid, seqs):
+        """Encode an ACK/NACK, splitting it across datagrams when it would exceed the MTU.
+
+        A lossy burst encodes to several KB of records. Crammed into one UDP datagram
+        that exceeds the path MTU it is dropped (or IP-fragmented and then dropped on
+        most paths), so the peer never learns what arrived and retransmits the entire
+        window anyway - the exact traffic the ACK was meant to prevent.
+        """
+        # Truncate before sorting: a range must never straddle the 24-bit wrap or the
+        # receiver would decode an inverted (empty) range and silently drop the acks.
+        seqs = sorted(set(s & 0xFFFFFF for s in seqs))
         recs = []
         i = 0
         while i < len(seqs):
@@ -882,7 +1038,22 @@ class Session:
                     + seqs[j].to_bytes(3, "little")
                 )
             i = j + 1
-        return bytes([pid]) + struct.pack(">H", len(recs)) + b"".join(recs)
+
+        limit = max(64, self.mtu - 28)
+        header = 1 + 2  # packet id + record count
+        out = []
+        cur = []
+        used = header
+        for rec in recs:
+            if cur and used + len(rec) > limit:
+                out.append(bytes([pid]) + struct.pack(">H", len(cur)) + b"".join(cur))
+                cur = []
+                used = header
+            cur.append(rec)
+            used += len(rec)
+        if cur:
+            out.append(bytes([pid]) + struct.pack(">H", len(cur)) + b"".join(cur))
+        return out
 
     def on_rak_payload(self, p):
         if not p:
@@ -1270,10 +1441,54 @@ class Session:
             [self._pk(PID_SET_ACTOR_MOTION, build_set_actor_motion(self.rid, self.motion))]
         )
 
-    def damage(self, amount, attacker=None):
+    def sync_attributes(self):
+        """Send UpdateAttributes so the client's health bar tracks the server's value.
+
+        PocketMine rebroadcasts attributes on every health change; pywer only ever sent
+        them once at spawn, so the bar stayed at 20/20 no matter how much damage landed.
+        """
+        self.send_packet(PID_UPDATE_ATTRIBUTES, build_update_attributes(self))
+
+    def damage(self, amount, attacker=None, source_rid=None, cause=None):
+        """Entity::attack / EntityDamageEvent pipeline for players.
+
+        `source_rid` is the keyword Projectiles use; it resolves back to the shooting
+        actor - player *or* mob - so a skeleton's arrow carries the same damager,
+        knockback and death message as a melee hit. Without it a projectile landing on
+        a player raised TypeError straight out of EntityManager.tick and took the whole
+        tick loop with it.
+
+        `cause` defaults from what actually hit us rather than always claiming
+        "entity_attack": a void or environmental hit that passes through here would
+        otherwise tell plugins it was a mob.
+        """
         if self.dead or self.hurt_time > 0:
             return False
-        self.health = max(0.0, self.health - max(0.0, float(amount)))
+        amount = float(amount)
+        # Zero is a real impact - a snowball or an egg does no damage but must still
+        # fire the event, play the hurt animation and knock the target back. Only a
+        # negative amount is meaningless.
+        if amount < 0.0:
+            return False
+        if attacker is None and source_rid is not None:
+            attacker = resolve_actor(self.srv, source_rid)
+        if cause is None:
+            cause = (
+                "entity_attack"
+                if (attacker is not None or source_rid is not None)
+                else "generic"
+            )
+        if attacker is not None:
+            ev = EntityDamageByEntityEvent(self, attacker, amount, cause)
+        else:
+            ev = EntityDamageEvent(self, amount, cause)
+        events.call(ev)
+        if ev.is_cancelled:
+            return False
+        amount = float(ev.amount)
+        if amount < 0.0:
+            return False
+        self.health = max(0.0, self.health - amount)
         self.hurt_time = 10
         if attacker is not None:
             dx = self.feet()[0] - attacker.feet()[0]
@@ -1284,13 +1499,55 @@ class Session:
         self.srv.broadcast(
             [self._pk(PID_ACTOR_EVENT, build_actor_event(self.rid, ANIMATE_ACTION_HURT))]
         )
+        self.sync_attributes()
         if self.health <= 0:
-            self.dead = True
-            self.health = 0.0
-            self.teleport(SPAWN[0] + 0.5, SPAWN[1] + 1.0, SPAWN[2] + 0.5)
-            self.health = self.max_health
-            self.dead = False
+            self._on_death(attacker)
         return True
+
+    def _on_death(self, killer=None):
+        """Player::onDeath + immediate respawn: event, announcement, then heal and move."""
+        self.dead = True
+        self.health = 0.0
+        if killer is not None:
+            killer_name = getattr(killer, "name", None)
+            if not killer_name:
+                ident = getattr(killer, "identifier", "") or ""
+                killer_name = ident.rsplit(":", 1)[-1] or "something"
+            message = "§e%s was slain by %s" % (self.name, killer_name)
+        else:
+            killer_name = "nothing"
+            message = "§e%s died" % self.name
+        ev = events.call(PlayerDeathEvent(self, death_message=message))
+        if ev.death_message:
+            self.srv.broadcast([self._pk(PID_TEXT, build_text(0, "", ev.death_message))])
+        respawn_pos = (SPAWN[0] + 0.5, SPAWN[1] + 1.0, SPAWN[2] + 0.5)
+        # Dispatched before the teleport, not after it: the whole point of this event is
+        # to let a plugin redirect the respawn (bed, lobby, arena), and firing it once
+        # the player was already moved - with the return value thrown away - meant the
+        # only spawn-point hook could never choose anything. A malformed rewrite falls
+        # back to the world spawn instead of teleporting the player into garbage.
+        ev = events.call(PlayerRespawnEvent(self, respawn_pos))
+        pos = getattr(ev, "respawn_pos", None)
+        if not (
+            isinstance(pos, (list, tuple))
+            and len(pos) == 3
+            and all(isinstance(v, (int, float)) for v in pos)
+        ):
+            pos = respawn_pos
+        else:
+            pos = (float(pos[0]), float(pos[1]), float(pos[2]))
+        self.teleport(*pos)
+        self.health = self.max_health
+        self.hurt_time = 0
+        self.fall_distance = 0.0
+        self.last_fall = 0.0
+        self.dead = False
+        self.sync_attributes()
+        self.send_data()
+        log(
+            "Player",
+            "%s died (killed by %s), respawned at %s" % (self.name, killer_name, pos),
+        )
 
     def send_data(self, to_all=False):
         """Entity::sendData: SetActorData with flags + bounding box (to everybody, or only to this player)."""

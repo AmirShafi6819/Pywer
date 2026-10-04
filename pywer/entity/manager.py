@@ -15,6 +15,32 @@ from .base import Entity
 from .item import ItemEntity, MERGE_RANGE, PICKUP_DELAY
 
 
+def resolve_actor(srv: Any, rid: Any) -> Any:
+    """Resolve a network actor id to a player session or a world entity.
+
+    Players live in `srv.playing()`, mobs/items/projectiles live in
+    `srv.entity_mgr.entities`. Searching only one of the two collections makes every
+    RID lookup wrong for the other half of the world: a punch at a zombie found no
+    target and was silently dropped, and an arrow shot by a skeleton could not be
+    attributed to its shooter, so it produced no damager, no knockback and a death
+    message that read "died" instead of "slain by skeleton".
+
+    Players are checked first so an id collision (there is none by construction, but
+    a player is the more specific answer) never shadows a session.
+    """
+    if rid is None:
+        return None
+    playing = getattr(srv, "playing", None)
+    if callable(playing):
+        for actor in playing():
+            if getattr(actor, "rid", None) == rid:
+                return actor
+    entities = getattr(getattr(srv, "entity_mgr", None), "entities", None)
+    if isinstance(entities, dict):
+        return entities.get(rid)
+    return None
+
+
 class EntityManager:
     """Manages all world entities with spatial chunk indexing and distance culling."""
 
@@ -148,10 +174,14 @@ class EntityManager:
         """Finds all non-dead entities within euclidean radius of pos using chunk index."""
         px, py, pz = pos
         r_sq = radius * radius
-        min_cx = int(px - radius) >> 4
-        max_cx = int(px + radius) >> 4
-        min_cz = int(pz - radius) >> 4
-        max_cz = int(pz + radius) >> 4
+        # Chunk bounds must be floored, not truncated: int(-0.5) is 0 while
+        # math.floor(-0.5) is -1, so truncating dropped the whole -1 bucket from
+        # the scan and every entity just west/north of the origin became invisible
+        # to merges, projectile hits and mob target acquisition.
+        min_cx = math.floor(px - radius) >> 4
+        max_cx = math.floor(px + radius) >> 4
+        min_cz = math.floor(pz - radius) >> 4
+        max_cz = math.floor(pz + radius) >> 4
 
         res: List[Entity] = []
         for cx in range(min_cx, max_cx + 1):
@@ -177,6 +207,7 @@ class EntityManager:
     ) -> bool:
         """Drops an item entity in the world, merging with nearby matching stacks if possible."""
         from ..world.blocks import ITEM_RUNTIME
+        from ..player.inventory import MAX_STACK
 
         if item_key not in ITEM_RUNTIME:
             return False
@@ -187,33 +218,54 @@ class EntityManager:
         now = time.time() if now is None else now
         px, py, pz = float(pos[0]), float(pos[1]), float(pos[2])
 
-        # Attempt stack merging with nearby items
+        # Merge into nearby matching stacks first, but never past the stack limit - an
+        # unbounded merge is what let a single entity hold an arbitrary count, which the
+        # pickup path would then duplicate. Anything that does not fit stays behind.
         for e in self.entities_near((px, py, pz), radius=MERGE_RANGE):
-            if isinstance(e, ItemEntity) and e.item_key == item_key and not e.dead:
-                e.count += count
-                e.age = 0.0
-                e.spawned_at = now
-                e.pickup_at = now + PICKUP_DELAY
-                return True
+            if count <= 0:
+                break
+            if not isinstance(e, ItemEntity) or e.item_key != item_key or e.dead:
+                continue
+            room = MAX_STACK - e.count
+            if room <= 0:
+                continue
+            absorbed = min(room, count)
+            e.count += absorbed
+            count -= absorbed
+            e.age = 0.0
+            e.spawned_at = now
+            e.pickup_at = now + PICKUP_DELAY
+        if count <= 0:
+            return True
 
-        rand_motion = motion or (
-            random.random() * 0.2 - 0.1,
-            0.2,
-            random.random() * 0.2 - 0.1,
-        )
-        # False when a plugin cancelled the spawn: the caller must not treat a refusal
-        # as a successful drop.
-        return (
-            self.spawn(
-                ItemEntity,
-                item_key,
-                count,
-                pos=(px, py, pz),
-                motion=rand_motion,
-                spawned_at=now,
+        # A single entity never holds more than one stack: otherwise pickup accounting
+        # would have to hand out partial stacks that no client expects.
+        spawned_any = False
+        while count > 0:
+            take = min(count, MAX_STACK)
+            count -= take
+            rand_motion = motion or (
+                random.random() * 0.2 - 0.1,
+                0.2,
+                random.random() * 0.2 - 0.1,
             )
-            is not None
-        )
+            if (
+                self.spawn(
+                    ItemEntity,
+                    item_key,
+                    take,
+                    pos=(px, py, pz),
+                    motion=rand_motion,
+                    spawned_at=now,
+                )
+                is None
+            ):
+                # A plugin vetoed EntitySpawnEvent. Whatever already landed in the world
+                # is real and has to be paid for, so the refusal ends the drop instead of
+                # letting the caller keep items that are already lying on the ground.
+                break
+            spawned_any = True
+        return spawned_any
 
     def tick(
         self, now: float, dt: float, world_is_solid: Callable[[int, int, int], bool]
@@ -223,8 +275,11 @@ class EntityManager:
         active_chunks: Set[Tuple[int, int]] = set()
 
         for p in players:
-            pcx = getattr(p, "cx", int(getattr(p, "x", 0)) >> 4)
-            pcz = getattr(p, "cz", int(getattr(p, "z", 0)) >> 4)
+            pos = getattr(p, "pos", None)
+            if pos is None:
+                continue
+            pcx = math.floor(pos[0]) >> 4
+            pcz = math.floor(pos[2]) >> 4
             for dx in range(-4, 5):
                 for dz in range(-4, 5):
                     active_chunks.add((pcx + dx, pcz + dz))
@@ -242,7 +297,7 @@ class EntityManager:
         from ..protocol.packet_ids import PID_MOVE_ACTOR_ABSOLUTE
         from ..player.session import Session
         from ..world.blocks import ITEM_RUNTIME
-        from ..player.inventory import add_item, first_empty_slot, item_tuple
+        from ..player.inventory import add_item, item_tuple
 
         move_pkts = []
         for e in list(to_tick):
@@ -285,21 +340,28 @@ class EntityManager:
 
             # Check item pickup for ItemEntity
             if isinstance(e, ItemEntity):
+                # An item key with no runtime id can never be handed to a player, so
+                # resolve it once per entity instead of per player: an early exit from
+                # the player loop used to make the whole item look like a hard stop.
+                item_id = ITEM_RUNTIME.get(e.item_key)
+                if item_id is None:
+                    continue
                 for p in players:
                     if not e.can_pickup(p.feet(), now, world_is_solid):
                         continue
-                    item_id = ITEM_RUNTIME.get(e.item_key)
-                    if item_id is None:
-                        break
-                    if first_empty_slot(p.inventory) is None:
-                        continue
+                    # add_item already writes the slots it managed to fill, so the only
+                    # correct bookkeeping is to remove exactly what was inserted. Treating
+                    # a partial insert as "player full" left the whole stack in the world
+                    # and gave the player a copy of it.
                     left = add_item(p.inventory, item_tuple(item_id, e.count, 0))
-                    if left > 0:
+                    taken = e.count - left
+                    if taken <= 0:
                         continue
-                    taken = e.count
-                    e.count = 0
+                    e.count = left
                     p.sync_inventory()
-                    self.remove(e.rid)
+                    if e.count <= 0:
+                        self.remove(e.rid)
+                    # Whatever did not fit stays in the world for the next attempt.
                     break
 
         if move_pkts and hasattr(self.srv, "broadcast"):
