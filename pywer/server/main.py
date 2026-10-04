@@ -30,31 +30,40 @@ def main():
         elif env_enc is not None:
             config.PROXY_ENCRYPTION = env_enc
 
-    srv = Server(args.port, bind=args.bind)
-    srv.banner()
-    if config.PROXY_MODE:
-        print("Proxy mode: ON (WaterdogPE) | encryption: %s" % (
-            "off" if config.PROXY_ENCRYPTION is False else "on" if config.ENCRYPTION else "off"), flush=True)
+    srv = None
+    shutting_down = False
 
-    # Save on SIGTERM too, so `kill` and service managers persist the world like Ctrl+C does.
+    # Save on SIGTERM too, so `kill` and service managers persist the world like Ctrl+C
+    # does. A second signal while shutting down must not interrupt the shutdown itself.
     def _terminate(_signum, _frame):
+        nonlocal shutting_down
+        if shutting_down:
+            return
+        shutting_down = True
         raise KeyboardInterrupt
 
-    try:
-        signal.signal(signal.SIGTERM, _terminate)
-    except (ValueError, OSError):
-        pass
+    for _name in ("SIGINT", "SIGTERM"):
+        try:
+            signal.signal(getattr(signal, _name), _terminate)
+        except (ValueError, OSError, AttributeError):
+            pass
 
     try:
+        srv = Server(args.port, bind=args.bind)
+        srv.banner()
+        if config.PROXY_MODE:
+            print("Proxy mode: ON (WaterdogPE) | encryption: %s" % (
+                "off" if config.PROXY_ENCRYPTION is False else "on" if config.ENCRYPTION else "off"), flush=True)
         srv.run()
+        print("bye")
     except KeyboardInterrupt:
         print("bye")
     finally:
-        try:
-            srv.save_all(force=True)
-            print("[INFO] [Storage] saved world and player data")
-        except Exception as e:
-            print("[INFO] [Storage] save on exit failed: %r" % (e,))
+        if srv is not None:
+            try:
+                srv.stop()
+            except Exception as e:
+                print("[ERROR] [Server] shutdown failed: %r" % (e,), flush=True)
 
 
 if __name__ == "__main__":

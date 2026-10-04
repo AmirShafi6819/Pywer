@@ -52,6 +52,35 @@ from ..plugin import PluginManager
 TICK_INTERVAL = 0.05
 MAX_CATCHUP_TICKS = 5
 
+# Server-list game mode label. Kept in sync with config.GAMEMODE so the ping response
+# and the advertised game mode cannot drift apart.
+GAMEMODE_NAMES = {
+    0: "Survival",
+    1: "Creative",
+    2: "Adventure",
+    3: "Spectator",
+    5: "Survival",
+    6: "Creative",
+}
+
+
+def build_motd(guid, port):
+    """Unconnected ping response.
+
+    The advertised game mode comes from config.GAMEMODE so the server list can never
+    claim a mode the server is not actually running.
+    """
+    mode = config.GAMEMODE & 0x7
+    return "MCPE;pywer-v0.9.1dev;%d;%s;0;1;%d;Minimal;%s;%d;%d;%d;" % (
+        config.PROTOCOL,
+        config.GAME_VERSION,
+        guid,
+        GAMEMODE_NAMES.get(mode, "Survival"),
+        mode,
+        port,
+        port + 1,
+    )
+
 
 class Server:
     SEND_TIMEOUT = 2.0
@@ -89,18 +118,16 @@ class Server:
         self.plugin_data_dir = self.plugins_dir / "data"
         self.plugin_mgr = PluginManager(self, self.plugins_dir, self.plugin_data_dir)
         self.plugin_manager = self.plugin_mgr
+        self._stopped = False
+        self._next_tick = time.perf_counter() + TICK_INTERVAL
+        # The world must exist before plugins are enabled: an on_enable implementation is
+        # allowed to read the level, and ServerLoadEvent is only meaningful once the level
+        # has been loaded.
         self.plugin_mgr.load_all_plugins()
+        self.load_world()
         self.plugin_mgr.enable_all()
         self.event_mgr.call(ServerLoadEvent(self))
-        self._next_tick = time.perf_counter() + TICK_INTERVAL
-        self.load_world()
-        self.motd = "MCPE;pywer-v0.9.1dev;%d;%s;0;1;%d;Minimal;Creative;1;%d;%d;" % (
-            config.PROTOCOL,
-            config.GAME_VERSION,
-            self.guid,
-            port,
-            port + 1,
-        )
+        self.motd = build_motd(self.guid, port)
 
     def send(self, data, addr):
         """UDP send that survives a full kernel send buffer."""
@@ -163,7 +190,9 @@ class Server:
             self.player_storage.put(p.uuid, p.to_dict())
         self.player_storage.save(force=force)
         self._last_save = time.time()
-        self._window_id = CONTAINER_ID_FIRST
+        # Note: the window-id counter is deliberately not reset here. Autosave runs while
+        # containers may still be open, and rewinding the counter would let the next
+        # container reuse a window id that is already in flight.
 
     def save_player(self, p):
         self.player_storage.put(p.uuid, p.to_dict())
@@ -474,17 +503,36 @@ class Server:
             self.step()
 
     def stop(self):
-        """Cleanly shut down plugins, scheduler, worker pool, save world, and close socket."""
-        try:
-            self.event_mgr.call(ServerStopEvent())
-        except Exception:
-            pass
-        if hasattr(self, "plugin_mgr"):
-            self.plugin_mgr.disable_all()
-        self.scheduler.shutdown()
-        self.save_all(force=True)
-        self.worker_pool.shutdown()
-        try:
-            self.sock.close()
-        except OSError:
-            pass
+        """Shut down plugins, scheduler, workers, persist the world and close the socket.
+
+        Idempotent and failure-isolated: every step is guarded so that one subsystem
+        failing to shut down still releases the others, and a second call is a no-op.
+        Tolerates a partially constructed server so a failure during __init__ can still
+        release what was already acquired.
+        """
+        if getattr(self, "_stopped", False):
+            return
+        self._stopped = True
+
+        def _persist():
+            self.save_all(force=True)
+            log("Storage", "saved world and player data")
+
+        steps = (
+            ("ServerStopEvent", lambda: self.event_mgr.call(ServerStopEvent(self))),
+            ("plugins", lambda: self.plugin_mgr.disable_all()),
+            ("scheduler", self.scheduler.shutdown),
+            ("storage", _persist),
+            ("workers", self.worker_pool.shutdown),
+        )
+        for name, step in steps:
+            try:
+                step()
+            except Exception as e:
+                log("Server", "%s shutdown failed: %r" % (name, e))
+        sock = getattr(self, "sock", None)
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
