@@ -2518,6 +2518,20 @@ class Session:
                 return
         self.chunk_send_queue.append((cx, cz, payload))
 
+    def on_chunk_failed(self, cx, cz, error):
+        """Callback from background worker when a chunk could not be built.
+
+        Releases the in-flight slot queue_chunks() claimed before submitting the
+        job. Without this the coord stays claimed for the rest of the session and
+        queue_chunks() skips it forever, which is a permanently missing chunk.
+        Deliberately no retry here: an immediate resubmit would spin on a job that
+        is failing for a reason, so the coord is picked up again by the next
+        queue_chunks() call (spawn, or a chunk-boundary crossing), exactly like any
+        other chunk that has not been sent yet.
+        """
+        self.chunks_in_flight.discard((cx, cz))
+        log("Worker", "chunk (%s, %s) build failed: %r" % (cx, cz, error))
+
     def queue_chunks(self):
         cx, cz = self.center
         r = self.radius
