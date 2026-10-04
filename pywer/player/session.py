@@ -12,11 +12,16 @@ from .. import config
 from ..crypto.bedrock import BedrockCipher
 from ..crypto.ec import ecdh, pub_to_spki, spki_to_pub
 from ..crypto.jwt import jwt_make_es384
+from ..entity.manager import resolve_actor
 from ..event import (
     BlockBreakEvent,
     BlockPlaceEvent,
+    EntityDamageByEntityEvent,
+    EntityDamageEvent,
     PlayerChatEvent,
     PlayerCommandPreprocessEvent,
+    PlayerDeathEvent,
+    PlayerRespawnEvent,
 )
 from ..event import manager as events
 from ..log import dbg, log
@@ -1398,10 +1403,54 @@ class Session:
             [self._pk(PID_SET_ACTOR_MOTION, build_set_actor_motion(self.rid, self.motion))]
         )
 
-    def damage(self, amount, attacker=None):
+    def sync_attributes(self):
+        """Send UpdateAttributes so the client's health bar tracks the server's value.
+
+        PocketMine rebroadcasts attributes on every health change; pywer only ever sent
+        them once at spawn, so the bar stayed at 20/20 no matter how much damage landed.
+        """
+        self.send_packet(PID_UPDATE_ATTRIBUTES, build_update_attributes(self))
+
+    def damage(self, amount, attacker=None, source_rid=None, cause=None):
+        """Entity::attack / EntityDamageEvent pipeline for players.
+
+        `source_rid` is the keyword Projectiles use; it resolves back to the shooting
+        actor - player *or* mob - so a skeleton's arrow carries the same damager,
+        knockback and death message as a melee hit. Without it a projectile landing on
+        a player raised TypeError straight out of EntityManager.tick and took the whole
+        tick loop with it.
+
+        `cause` defaults from what actually hit us rather than always claiming
+        "entity_attack": a void or environmental hit that passes through here would
+        otherwise tell plugins it was a mob.
+        """
         if self.dead or self.hurt_time > 0:
             return False
-        self.health = max(0.0, self.health - max(0.0, float(amount)))
+        amount = float(amount)
+        # Zero is a real impact - a snowball or an egg does no damage but must still
+        # fire the event, play the hurt animation and knock the target back. Only a
+        # negative amount is meaningless.
+        if amount < 0.0:
+            return False
+        if attacker is None and source_rid is not None:
+            attacker = resolve_actor(self.srv, source_rid)
+        if cause is None:
+            cause = (
+                "entity_attack"
+                if (attacker is not None or source_rid is not None)
+                else "generic"
+            )
+        if attacker is not None:
+            ev = EntityDamageByEntityEvent(self, attacker, amount, cause)
+        else:
+            ev = EntityDamageEvent(self, amount, cause)
+        events.call(ev)
+        if ev.is_cancelled:
+            return False
+        amount = float(ev.amount)
+        if amount < 0.0:
+            return False
+        self.health = max(0.0, self.health - amount)
         self.hurt_time = 10
         if attacker is not None:
             dx = self.feet()[0] - attacker.feet()[0]
@@ -1412,13 +1461,55 @@ class Session:
         self.srv.broadcast(
             [self._pk(PID_ACTOR_EVENT, build_actor_event(self.rid, ANIMATE_ACTION_HURT))]
         )
+        self.sync_attributes()
         if self.health <= 0:
-            self.dead = True
-            self.health = 0.0
-            self.teleport(SPAWN[0] + 0.5, SPAWN[1] + 1.0, SPAWN[2] + 0.5)
-            self.health = self.max_health
-            self.dead = False
+            self._on_death(attacker)
         return True
+
+    def _on_death(self, killer=None):
+        """Player::onDeath + immediate respawn: event, announcement, then heal and move."""
+        self.dead = True
+        self.health = 0.0
+        if killer is not None:
+            killer_name = getattr(killer, "name", None)
+            if not killer_name:
+                ident = getattr(killer, "identifier", "") or ""
+                killer_name = ident.rsplit(":", 1)[-1] or "something"
+            message = "§e%s was slain by %s" % (self.name, killer_name)
+        else:
+            killer_name = "nothing"
+            message = "§e%s died" % self.name
+        ev = events.call(PlayerDeathEvent(self, death_message=message))
+        if ev.death_message:
+            self.srv.broadcast([self._pk(PID_TEXT, build_text(0, "", ev.death_message))])
+        respawn_pos = (SPAWN[0] + 0.5, SPAWN[1] + 1.0, SPAWN[2] + 0.5)
+        # Dispatched before the teleport, not after it: the whole point of this event is
+        # to let a plugin redirect the respawn (bed, lobby, arena), and firing it once
+        # the player was already moved - with the return value thrown away - meant the
+        # only spawn-point hook could never choose anything. A malformed rewrite falls
+        # back to the world spawn instead of teleporting the player into garbage.
+        ev = events.call(PlayerRespawnEvent(self, respawn_pos))
+        pos = getattr(ev, "respawn_pos", None)
+        if not (
+            isinstance(pos, (list, tuple))
+            and len(pos) == 3
+            and all(isinstance(v, (int, float)) for v in pos)
+        ):
+            pos = respawn_pos
+        else:
+            pos = (float(pos[0]), float(pos[1]), float(pos[2]))
+        self.teleport(*pos)
+        self.health = self.max_health
+        self.hurt_time = 0
+        self.fall_distance = 0.0
+        self.last_fall = 0.0
+        self.dead = False
+        self.sync_attributes()
+        self.send_data()
+        log(
+            "Player",
+            "%s died (killed by %s), respawned at %s" % (self.name, killer_name, pos),
+        )
 
     def send_data(self, to_all=False):
         """Entity::sendData: SetActorData with flags + bounding box (to everybody, or only to this player)."""

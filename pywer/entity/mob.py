@@ -22,14 +22,72 @@ class LivingEntity(Entity):
         self.max_health = float(max_health)
         self.hurt_time = 0
 
-    def damage(self, amount, source_rid=None):
+    def damage(self, amount, attacker=None, source_rid=None, cause=None):
+        """Entity::attack pipeline for non-player living entities.
+
+        The signature matches Session.damage on purpose: `Server.handle_entity_attack`
+        has one `target` variable that may hold either kind of actor, and passing a
+        session positionally used to land in `source_rid`, where a Session was compared
+        against integer rids, matched nothing, and the hit arrived as a bare
+        EntityDamageEvent with no damager and no knockback.
+        """
+        from ..event import EntityDamageByEntityEvent, EntityDamageEvent
+        from ..event import manager as events
+        from .manager import resolve_actor
+
         if self.dead or self.hurt_time > 0:
             return False
-        self.health = max(0.0, self.health - float(amount))
+        amount = float(amount)
+        # Zero-damage impacts (snowball, egg) must still dispatch the event and play
+        # the hurt animation; only a negative amount is meaningless.
+        if amount < 0.0:
+            return False
+        if attacker is None and source_rid is not None:
+            attacker = resolve_actor(self.srv, source_rid)
+        if cause is None:
+            cause = (
+                "entity_attack"
+                if (attacker is not None or source_rid is not None)
+                else "generic"
+            )
+        ev = (
+            EntityDamageByEntityEvent(self, attacker, amount, cause)
+            if attacker is not None
+            else EntityDamageEvent(self, amount, cause)
+        )
+        events.call(ev)
+        if ev.is_cancelled:
+            return False
+        amount = float(ev.amount)
+        if amount < 0.0:
+            return False
+        self.health = max(0.0, self.health - amount)
         self.hurt_time = 10
+        self.broadcast_damage()
         if self.health <= 0.0:
             self.dead = True
         return True
+
+    def broadcast_damage(self):
+        """Push the hurt animation and the new health to every client.
+
+        Nothing told the clients a mob had been hit: the ActorEvent never went out and
+        the attributes packet was only ever built for players. Both packets go out in
+        one broadcast - two calls would deflate and hand off two RakNet datagrams to
+        every connected client for a single event.
+        """
+        if not hasattr(self.srv, "broadcast"):
+            return
+        from ..packets.entity import build_actor_event, build_update_attributes
+        from ..player.session import ANIMATE_ACTION_HURT, Session
+        from ..protocol.packet_ids import PID_ACTOR_EVENT, PID_UPDATE_ATTRIBUTES
+
+        self.srv.broadcast(
+            [
+                Session._pk(PID_ACTOR_EVENT, build_actor_event(self.rid, ANIMATE_ACTION_HURT)),
+                Session._pk(PID_UPDATE_ATTRIBUTES, build_update_attributes(self)),
+            ]
+        )
 
     def tick_living(self):
         if self.hurt_time > 0:

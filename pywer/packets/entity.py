@@ -51,9 +51,11 @@ def build_level_event(event_id, event_data, pos):
 
 def build_update_attributes(p):
     """PocketMine AttributeFactory/StandardEntityEventBroadcaster: default movement + health attributes."""
+    max_health = float(getattr(p, "max_health", 20.0))
+    health = max(0.0, min(max_health, float(getattr(p, "health", max_health))))
     entries = [
         ("minecraft:movement", 0.0, 3.402823466e38, 0.10, 0.0, 3.402823466e38, 0.10),
-        ("minecraft:health", 0.0, 20.0, max(0.0, min(20.0, p.health)), 0.0, 20.0, 20.0),
+        ("minecraft:health", 0.0, max_health, health, 0.0, max_health, max_health),
         ("minecraft:knockback_resistance", 0.0, 1.0, 0.0, 0.0, 1.0, 0.0),
         ("minecraft:underwater_movement", 0.0, 3.402823466e38, 0.02, 0.0, 3.402823466e38, 0.02),
     ]

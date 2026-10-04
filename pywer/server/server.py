@@ -43,7 +43,7 @@ from ..player.movement import NETWORK_EYE_OFFSET
 from ..player.session import Session
 from ..event import manager as events, PlayerJoinEvent, PlayerQuitEvent, ServerLoadEvent, ServerStopEvent
 from .worker import WorkerPool
-from ..entity.manager import EntityManager
+from ..entity.manager import EntityManager, resolve_actor
 from ..world.cache import ChunkCache
 from ..scheduler import ServerScheduler
 from ..command import CommandManager, CommandSender, PlayerCommandSender, ConsoleCommandSender
@@ -261,13 +261,14 @@ class Server:
                 log("Player", "send error: %r" % e)
 
     def handle_entity_attack(self, attacker, target_rid, player_pos, click_pos):
-        """PocketMine Player::attackEntity-style validation for player-vs-player hits."""
-        target = None
-        for s in self.playing():
-            if s.rid == target_rid:
-                target = s
-                break
-        if target is None or target is attacker or target.dead:
+        """PocketMine Player::attackEntity-style validation for melee hits.
+
+        The target may be another player or any world entity - `playing()` only holds
+        sessions, so a punch at a zombie used to resolve to nothing and the whole attack
+        (swing, damage, hurt animation) was dropped before anything happened.
+        """
+        target = resolve_actor(self, target_rid)
+        if target is None or target is attacker or getattr(target, "dead", False):
             return False
         if attacker.attack_time > 0:
             return False
@@ -281,6 +282,9 @@ class Server:
         if sum((player_pos[i] - (af[i] + (0.0 if i != 1 else NETWORK_EYE_OFFSET))) ** 2 for i in range(3)) > 4.0:
             return False
         attacker.attack_time = 10
+        # Inbound AnimatePacket is not relayed, so without this other players never saw
+        # the swing of a hit - only the miss path (F_MISSED_SWING) animated anything.
+        attacker.broadcast_arm_swing()
         target.damage(1.0, attacker)
         return True
 
