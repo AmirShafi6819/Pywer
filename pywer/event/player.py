@@ -74,7 +74,7 @@ class PlayerInteractEvent(Cancellable, PlayerEvent):
     def __init__(
         self,
         player: Any,
-        item: Any,
+        item: Tuple[int, int, int],
         action: int,
         block_pos: Optional[Tuple[int, int, int]] = None,
         face: Optional[int] = None,
@@ -89,7 +89,7 @@ class PlayerInteractEvent(Cancellable, PlayerEvent):
 class PlayerDropItemEvent(Cancellable, PlayerEvent):
     """Fired when a player drops an item into the world."""
 
-    def __init__(self, player: Any, item: Any) -> None:
+    def __init__(self, player: Any, item: Tuple[int, int, int]) -> None:
         super().__init__(player)
         self.item = item
 

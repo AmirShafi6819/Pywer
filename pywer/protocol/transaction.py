@@ -38,7 +38,12 @@ def read_signed_block_pos(r):
 
 def read_block_pos(r):
     # PacketSerializer::getBlockPosition() - Y is written unsigned (signInt applied afterwards)
-    return (r.read_varint32(), r.read_varuint32(), r.read_varint32())
+    x = r.read_varint32()
+    y = r.read_varuint32()
+    if y >= 0x80000000:
+        y -= 0x100000000
+    z = r.read_varint32()
+    return (x, y, z)
 
 
 def read_vec3(r):

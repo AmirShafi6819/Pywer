@@ -20,12 +20,24 @@ def build_add_player(p):
     w.write_float(p.yaw)
     w.write_float(p.head_yaw)
     w.write_varint32(0)  # held item: air
-    w.write_varint32(config.GAMEMODE)
+    gamemode = getattr(p, "gamemode", config.GAMEMODE)
+    if gamemode not in config.VALID_GAMEMODES:
+        gamemode = 0
+    w.write_varint32(gamemode)
     write_metadata(w, entity_metadata(p))  # flags, scale, bounding box
     w.write_varuint32(0)
     w.write_varuint32(0)  # synced properties (int, float)
-    # abilities (UpdateAbilitiesPacket payload)
-    w.write_bytes(build_abilities_payload(p.rid))
+    # abilities (UpdateAbilitiesPacket payload) - the *other* players see this player's
+    # gamemode and flight state, so both come from the session, never from the config
+    # default, or a restored creative player is rendered as survival by everyone else.
+    w.write_bytes(
+        build_abilities_payload(
+            p.rid,
+            gamemode=gamemode,
+            flying=getattr(p, "flying", False),
+            allow_flight=getattr(p, "allow_flight", None),
+        )
+    )
     w.write_varuint32(0)  # entity links
     w.write_string(str(p.client_data.get("DeviceId", "")))
     w.write_i32(int(p.client_data.get("DeviceOS", 0) or 0))

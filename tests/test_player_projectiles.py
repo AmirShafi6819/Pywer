@@ -81,6 +81,70 @@ class TestPlayerProjectiles(unittest.TestCase):
         self.assertEqual(spawn_args[0][0], Snowball)
         self.assertEqual(sess.inventory[0], (332, 15, 0))
 
+    def _survival_session(self, veto_spawn=False):
+        srv = MagicMock()
+        srv.next_rid = 1
+        srv.key = (MagicMock(), MagicMock())
+        srv.entity_mgr = MagicMock()
+        srv.entity_mgr.spawn.return_value = None if veto_spawn else object()
+        sess = Session(srv, ("127.0.0.1", 19132), 1400, 100)
+        sess._set_feet((0, 64, 0))
+        sess.selected_slot = 0
+        sess.gamemode_is_creative = lambda: False
+        return srv, sess
+
+    def test_bow_release_keeps_the_arrow_when_spawn_is_vetoed(self):
+        """A plugin refusing EntitySpawnEvent must not turn a shot into lost ammo."""
+        srv, sess = self._survival_session(veto_spawn=True)
+        sess.inventory[0] = (261, 1, 0)
+        sess.inventory[9] = (262, 5, 0)
+
+        res = sess.handle_release_item({"action": 0, "hotbar": 0, "item": {"id": 261}})
+
+        self.assertTrue(res)
+        srv.entity_mgr.spawn.assert_called()
+        self.assertEqual(sess.inventory[9], (262, 5, 0))
+
+    def test_bow_release_is_refused_without_a_bow_in_hand(self):
+        """The transaction's item id is a client claim; the held slot is the truth."""
+        srv, sess = self._survival_session()
+        sess.inventory[0] = (0, 0, 0)  # empty hand
+        sess.inventory[9] = (262, 5, 0)
+
+        res = sess.handle_release_item({"action": 0, "hotbar": 0, "item": {"id": 261}})
+
+        self.assertFalse(res)
+        srv.entity_mgr.spawn.assert_not_called()
+        self.assertEqual(sess.inventory[9], (262, 5, 0))
+
+    def test_snowball_is_kept_when_spawn_is_vetoed(self):
+        srv, sess = self._survival_session(veto_spawn=True)
+        sess.inventory[0] = (332, 16, 0)
+
+        res = sess.handle_use_item({"action": 1, "hotbar": 0, "item": {"id": 332}})
+
+        self.assertTrue(res)
+        srv.entity_mgr.spawn.assert_called()
+        self.assertEqual(sess.inventory[0], (332, 16, 0))
+
+    def test_snowball_is_not_thrown_without_snowballs_in_hand(self):
+        srv, sess = self._survival_session()
+        sess.inventory[0] = (261, 1, 0)  # holding a bow, claiming a snowball
+
+        res = sess.handle_use_item({"action": 1, "hotbar": 0, "item": {"id": 332}})
+
+        self.assertFalse(res)
+        srv.entity_mgr.spawn.assert_not_called()
+        self.assertEqual(sess.inventory[0], (261, 1, 0))
+
+    def test_snowball_stack_never_goes_negative_from_a_stale_slot(self):
+        srv, sess = self._survival_session()
+        sess.inventory[0] = (332, 0, 0)  # count already spent
+
+        sess.handle_use_item({"action": 1, "hotbar": 0, "item": {"id": 332}})
+
+        self.assertEqual(sess.inventory[0], (0, 0, 0))
+
 
 if __name__ == "__main__":
     unittest.main()
