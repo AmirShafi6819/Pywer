@@ -4,7 +4,45 @@ import json
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+#: The plugin API version this server implements. A plugin declares the API it was
+#: built against in its manifest; a plugin that needs a newer one is refused rather
+#: than loaded into a server that cannot answer its calls.
+PLUGIN_API_VERSION = "1.0"
+
+
+def parse_api_version(value: Any) -> Optional[Tuple[int, int]]:
+    """Parse a dotted API version into ``(major, minor)``.
+
+    Tolerates a missing minor ("1" reads as 1.0) and patch segments ("1.0.3" reads
+    as 1.0). Returns None for anything that is not a usable version, so callers can
+    treat a malformed manifest as an incompatibility instead of an exception.
+    """
+    if not isinstance(value, str):
+        return None
+    parts = value.strip().split(".")
+    try:
+        major = int(parts[0])
+        minor = int(parts[1]) if len(parts) > 1 else 0
+    except ValueError:
+        return None
+    return (major, minor)
+
+
+def api_version_supported(requested: Any) -> bool:
+    """Whether a plugin built for ``requested`` can run against this server.
+
+    Major versions must match outright: 2.x is a different API generation. Within a
+    major, the plugin's minor may not exceed the server's, because the plugin pins
+    the API it was written against and would call methods this server does not have;
+    an older minor is accepted since minor revisions are backward compatible.
+    """
+    want = parse_api_version(requested)
+    have = parse_api_version(PLUGIN_API_VERSION)
+    if want is None or have is None:
+        return False
+    return want[0] == have[0] and want[1] <= have[1]
 
 
 @dataclass

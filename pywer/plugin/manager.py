@@ -4,9 +4,45 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Union
 
 from ..event.server import PluginDisableEvent, PluginEnableEvent
-from .base import PluginBase
+from .base import PLUGIN_API_VERSION, PluginBase, api_version_supported
 from .compiler import PluginCompiler
 from .loader import VirtualPluginLoader
+
+
+def _manifest_error(manifest: Dict[str, Any]) -> Optional[str]:
+    """Load-time manifest checks, or None when the manifest is usable.
+
+    The packer enforces all of this, but ``PluginCompiler.inspect`` reads an
+    already-built .pywer without validating it, so a hand-made or corrupt package
+    reaches this point carrying a manifest the loader cannot honour. Every problem
+    is a refusal reason rather than an exception: one bad package must not stop the
+    others from loading.
+    """
+    for req in PluginCompiler.REQUIRED_FIELDS:
+        if not manifest.get(req):
+            return f"missing required field '{req}'"
+    if not isinstance(manifest.get("name"), str):
+        return "field 'name' must be a string"
+    if ":" not in str(manifest["main"]):
+        return "field 'main' must be in format 'module_name:ClassName'"
+    if not api_version_supported(manifest.get("api_version")):
+        return (
+            f"requires plugin API {manifest.get('api_version')!r}, "
+            f"this server implements {PLUGIN_API_VERSION}"
+        )
+    for key in ("dependencies", "soft_dependencies"):
+        raw = manifest.get(key, [])
+        if not isinstance(raw, list) or not all(isinstance(d, str) for d in raw):
+            return f"field '{key}' must be a list of plugin names"
+    return None
+
+
+def _dependency_names(manifest: Dict[str, Any], key: str) -> List[str]:
+    """The manifest's dependency names for ``key``; absent or malformed reads as none."""
+    raw = manifest.get(key, [])
+    if not isinstance(raw, list):
+        return []
+    return [d for d in raw if isinstance(d, str)]
 
 
 class PluginManager:
@@ -47,7 +83,15 @@ class PluginManager:
             except Exception as e:
                 print(f"[ERROR] [Plugin] Failed to read package '{pkg_file.name}': {e}")
 
-        # 2. Dependency resolution using Topological Sort (DFS)
+        # 2. Refuse anything this server cannot serve, then order what is left.
+        #    A refusal on a hard dependency takes its dependents down with it;
+        #    soft dependencies only decide order and never take a plugin down.
+        skipped: Dict[str, str] = {}
+        for p_name, manifest in discovered.items():
+            problem = _manifest_error(manifest)
+            if problem:
+                skipped[p_name] = problem
+
         load_order: List[str] = []
         visited: Set[str] = set()
         visiting: Set[str] = set()
@@ -56,19 +100,32 @@ class PluginManager:
             if p_name in visiting:
                 print(f"[WARN] [Plugin] Circular dependency detected involving '{p_name}'.")
                 return
-            if p_name not in visited:
-                visiting.add(p_name)
-                deps = discovered[p_name].get("dependencies", [])
-                for dep in deps:
-                    if dep in discovered:
-                        visit(dep)
-                    else:
-                        print(
-                            f"[WARN] [Plugin] Plugin '{p_name}' depends on '{dep}', but '{dep}' is missing!"
-                        )
-                visiting.remove(p_name)
-                visited.add(p_name)
-                load_order.append(p_name)
+            if p_name in visited:
+                return
+            visiting.add(p_name)
+
+            manifest = discovered[p_name]
+            hard = _dependency_names(manifest, "dependencies")
+            soft = _dependency_names(manifest, "soft_dependencies")
+            # Visit dependencies first so their refusal is already known by the time
+            # this plugin's own refusal is decided below. Soft dependencies are
+            # visited only when present, which is what makes them optional.
+            for dep in hard + soft:
+                if dep in discovered:
+                    visit(dep)
+
+            if p_name not in skipped:
+                for dep in hard:
+                    if dep not in discovered:
+                        skipped[p_name] = f"missing hard dependency '{dep}'"
+                        break
+                    if dep in skipped:
+                        skipped[p_name] = f"dependency '{dep}' was skipped: {skipped[dep]}"
+                        break
+
+            visiting.remove(p_name)
+            visited.add(p_name)
+            load_order.append(p_name)
 
         for p_name in list(discovered.keys()):
             if p_name not in visited:
@@ -77,6 +134,10 @@ class PluginManager:
         # 3. Virtual load each plugin in dependency order
         loaded: List[PluginBase] = []
         for p_name in load_order:
+            reason = skipped.get(p_name)
+            if reason:
+                print(f"[ERROR] [Plugin] Skipped '{p_name}': {reason}")
+                continue
             pkg_path = file_map[p_name]
             try:
                 plugin = VirtualPluginLoader.load_plugin(
