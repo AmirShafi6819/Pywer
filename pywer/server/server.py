@@ -248,8 +248,11 @@ class Server:
         elif pid == 0x07:
             # packet id + magic, then the address, then the MTU and client GUID the
             # reader pulls next. Anything shorter is not an OpenConnectionRequest2, so
-            # reject it before the reader walks past the end of the packet.
-            if len(data) < 18:
+            # reject it before the reader walks past the end of the packet. The magic is
+            # checked for the same reason it is checked on 0x05: both halves of the
+            # handshake carry it, and a peer that got this far already proved it sends
+            # the right one.
+            if len(data) < 18 or data[1:17] != RAKNET_MAGIC:
                 return
             r = ByteReader(data, 17)
             if r.read_u8() == 4:

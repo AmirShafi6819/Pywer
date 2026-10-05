@@ -10,11 +10,13 @@ makes the entry disappear from the client's server list.
 duck-typed recorder instead of binding a real socket.
 """
 
+import contextlib
+import io
 import struct
 import unittest
 
 from pywer import config
-from pywer.net.raknet import RAKNET_MAGIC
+from pywer.net.raknet import RAKNET_MAGIC, enc_addr
 from pywer.server.server import Server, build_motd
 
 
@@ -79,7 +81,7 @@ class TestUnconnectedPong(unittest.TestCase):
 
 
 class TestTruncatedUnconnectedPackets(unittest.TestCase):
-    """Anything shorter than the packet it claims to be is dropped, not guessed at."""
+    """Anything that is not the packet it claims to be is dropped, not guessed at."""
 
     def test_ping_without_a_full_time_field_is_dropped(self):
         # The 8-byte time is echoed back verbatim and matched by the client; a shorter
@@ -94,6 +96,20 @@ class TestTruncatedUnconnectedPackets(unittest.TestCase):
         srv = PingRecorder()
         Server.unconnected(srv, b"\x05" + b"\x00" * 20, ("10.0.0.9", 50000))
         self.assertEqual(srv.sent, [])
+
+    def test_ocr2_without_the_magic_is_dropped(self):
+        # 0x05 refuses a peer that cannot produce the handshake magic; 0x07 used to
+        # accept the same bytes, so the two halves of one handshake disagreed.
+        for raw in (
+            b"\x07" + b"\x00" * 33,
+            b"\x07" + b"\x00" * 16 + enc_addr("10.0.0.9", 50000) + b"\x00" * 10,
+        ):
+            srv = PingRecorder()
+            srv.next_rid = 1
+            srv.on_leave = lambda s: None
+            Server.unconnected(srv, raw, ("10.0.0.9", 50000))
+            self.assertEqual(srv.sent, [], "OCR2 without magic answered: %r" % raw)
+            self.assertEqual(srv.sessions, {})
 
     def test_ocr2_without_an_address_is_dropped_without_raising(self):
         # ByteReader raises "short read" past the end of the packet. Upstream that
@@ -115,6 +131,61 @@ class TestTruncatedUnconnectedPackets(unittest.TestCase):
         Server.unconnected(srv, b"\x07" + RAKNET_MAGIC + b"\x04" + b"\x00" * 6, ("10.0.0.9", 50000))
         self.assertEqual(srv.sent, [])
         self.assertEqual(srv.sessions, {})
+
+
+class TestWellFormedHandshake(unittest.TestCase):
+    """The rejection rules must not cost us a peer that plays by the rules.
+
+    Every guard added to `unconnected()` is a packet that now gets ignored, so each
+    one needs a well-formed counterpart proving the happy path still answers with the
+    reply layout the spec requires - a guard that only ever sees its own failure case
+    is untested.
+    """
+
+    def _recorder(self):
+        srv = PingRecorder()
+        srv.next_rid = 1
+        srv.on_leave = lambda s: None
+        return srv
+
+    def test_ocr1_is_answered_with_a_laid_out_ocre1(self):
+        srv = self._recorder()
+        Server.unconnected(srv, b"\x05" + RAKNET_MAGIC + b"\x00" * 100, ("10.0.0.9", 50000))
+        self.assertEqual(len(srv.sent), 1)
+        reply = srv.sent[0][1]
+        self.assertEqual(reply[0], 0x06)
+        self.assertEqual(reply[1:17], RAKNET_MAGIC)
+        self.assertEqual(reply[17:25], struct.pack(">Q", srv.guid))
+        self.assertEqual(reply[25], 0)  # no security cookie is offered
+        self.assertEqual(len(reply), 28)
+        mtu = struct.unpack(">H", reply[26:28])[0]
+        self.assertGreaterEqual(mtu, 576)
+        self.assertLessEqual(mtu, 1492)
+
+    def test_ocr2_opens_a_session_and_answers_with_a_laid_out_ocre2(self):
+        srv = self._recorder()
+        addr = ("10.0.0.9", 50000)
+        raw = (
+            b"\x07"
+            + RAKNET_MAGIC
+            + enc_addr(*addr)
+            + struct.pack(">H", 1400)
+            + struct.pack(">Q", 0x1122334455667788)
+        )
+        self.assertEqual(len(raw), 34, "the shortest well-formed IPv4 OCR2")
+        with contextlib.redirect_stdout(io.StringIO()):
+            Server.unconnected(srv, raw, addr)
+        self.assertEqual(list(srv.sessions), [addr])
+        session = srv.sessions[addr]
+        self.assertEqual(session.mtu, 1400)
+        self.assertEqual(session.guid, 0x1122334455667788)
+        reply = srv.sent[-1][1]
+        self.assertEqual(len(reply), 35)
+        self.assertEqual(reply[0], 0x08)
+        self.assertEqual(reply[1:17], RAKNET_MAGIC)
+        self.assertEqual(reply[17:25], struct.pack(">Q", srv.guid))
+        self.assertEqual(reply[25:32], enc_addr(*addr))
+        self.assertEqual(struct.unpack(">HB", reply[32:35]), (1400, 0))
 
 
 class TestMotdTitle(unittest.TestCase):
