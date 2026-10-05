@@ -1,5 +1,7 @@
 """Unit tests for PluginManager lifecycle, dependency resolution, and auto-cleanup."""
 
+import contextlib
+import io
 import json
 import shutil
 import tempfile
@@ -7,6 +9,7 @@ import unittest
 import zipfile
 from pathlib import Path
 from typing import List
+from unittest import mock
 
 from pywer.command import Command, CommandManager, CommandSender
 from pywer.event import (
@@ -90,13 +93,22 @@ class {name}(PluginBase):
         pkg_path = self.plugins_dir / f"{name}.pywer"
         return PluginCompiler.pack(src, pkg_path)
 
-    def _create_raw_pkg(self, name: str, manifest: dict) -> Path:
+    def _create_raw_pkg(self, name: str, manifest) -> Path:
         """Write a .pywer straight to disk, bypassing the packer's own validation."""
         pkg_path = self.plugins_dir / f"{name}.pywer"
         with zipfile.ZipFile(pkg_path, "w", zipfile.ZIP_DEFLATED) as zf:
             zf.writestr("plugin.json", json.dumps(manifest))
             zf.writestr("main.py", f"class {name}:\n    pass\n")
         return pkg_path
+
+    def _load_in_glob_order(self, *pkg_files):
+        """load_all_plugins() with discovery order forced rather than left to the OS.
+
+        glob() order must not decide anything, so both orders have to give the
+        same answer for the same directory.
+        """
+        with mock.patch.object(Path, "glob", return_value=iter(pkg_files)):
+            return self.mgr.load_all_plugins()
 
     def test_dependency_resolution_order(self):
         # PluginA depends on PluginB
@@ -255,6 +267,40 @@ class ActivePlugin(PluginBase):
         loaded = self.mgr.load_all_plugins()
         self.assertEqual([p.name for p in loaded], ["Lib"])
 
+    def test_a_refusal_cannot_leak_past_a_cycle(self):
+        # CycleA <-> CycleB, with CycleB also missing a hard dependency. Deciding
+        # a refusal while a node was still being entered meant CycleA was checked
+        # before CycleB had refused, so it loaded without the dependency it
+        # declared - but only when glob() happened to hand back CycleB first.
+        pkg_a = self._create_plugin_pkg("CycleA", deps=["CycleB"])
+        pkg_b = self._create_raw_pkg(
+            "CycleB",
+            {
+                "name": "CycleB",
+                "version": "1.0.0",
+                "main": "main:CycleB",
+                "api_version": "1.0",
+                "dependencies": ["CycleA", "Ghost"],
+            },
+        )
+        for order in ((pkg_a, pkg_b), (pkg_b, pkg_a)):
+            with self.subTest(discovered_as=[p.name for p in order]):
+                loaded = self._load_in_glob_order(*order)
+                self.assertEqual(loaded, [])
+                self.assertIsNone(self.mgr.get_plugin("CycleA"))
+                self.assertIsNone(self.mgr.get_plugin("CycleB"))
+
+    def test_a_cycle_on_its_own_is_a_warning_and_both_still_load(self):
+        # A cycle with nothing wrong with it is a warning, not a refusal: only the
+        # missing dependency above makes its pair unservable.
+        pkg_a = self._create_plugin_pkg("LoopA", deps=["LoopB"])
+        pkg_b = self._create_plugin_pkg("LoopB", deps=["LoopA"])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            loaded = self._load_in_glob_order(pkg_a, pkg_b)
+        self.assertEqual(sorted(p.name for p in loaded), ["LoopA", "LoopB"])
+        self.assertIn("Circular dependency", out.getvalue())
+
     def test_soft_dependency_decides_order_but_is_not_required(self):
         self._create_plugin_pkg("User", soft_deps=["Helper"])
         self._create_plugin_pkg("Helper")
@@ -297,6 +343,54 @@ class ActivePlugin(PluginBase):
         )
         self.assertEqual(self.mgr.load_all_plugins(), [])
 
+    def test_a_manifest_without_a_name_is_refused_by_the_manifest_checks(self):
+        # This used to raise KeyError on manifest_data["name"] and be reported as
+        # an unreadable package, which also kept _manifest_error - the one place
+        # that formats refusals - from ever producing its reason.
+        self._create_raw_pkg(
+            "Nameless",
+            {"version": "1.0.0", "main": "main:Nameless", "api_version": "1.0"},
+        )
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            loaded = self.mgr.load_all_plugins()
+        self.assertEqual(loaded, [])
+        message = out.getvalue()
+        self.assertIn("Nameless.pywer", message)
+        self.assertIn("missing required field 'name'", message)
+        self.assertNotIn("Failed to read package", message)
+
+    def test_a_manifest_whose_json_is_not_an_object_is_refused(self):
+        # PluginCompiler.inspect returns whatever JSON parses to, so a package
+        # whose plugin.json is a list reaches discovery with nothing to index.
+        self._create_raw_pkg("NotAnObject", ["not", "a", "dict"])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            loaded = self.mgr.load_all_plugins()
+        self.assertEqual(loaded, [])
+        self.assertIn("not a plugin.json object", out.getvalue())
+
+    def test_a_second_package_cannot_take_a_name_that_is_already_taken(self):
+        # Two packages claiming one name used to overwrite each other silently,
+        # so which file the loader actually opened came down to glob() order.
+        self._create_plugin_pkg("Twin")
+        self._create_raw_pkg(
+            "TwinOther",
+            {"name": "Twin", "version": "1.0.0", "main": "main:Twin", "api_version": "1.0"},
+        )
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            loaded = self.mgr.load_all_plugins()
+        self.assertEqual([p.name for p in loaded], ["Twin"])
+        self.assertIn("already provided by 'Twin.pywer'", out.getvalue())
+
+    def test_a_manifest_with_a_negative_api_version_is_refused(self):
+        # int() takes "1.-1", and (1, -1) then passes the minor <= server minor
+        # test, so the manifest walked straight through the version gate.
+        self._create_plugin_pkg("Sneaky", api_version="1.-1")
+        self.assertEqual(self.mgr.load_all_plugins(), [])
+        self.assertIsNone(self.mgr.get_plugin("Sneaky"))
+
 
 class TestApiVersionCompatibility(unittest.TestCase):
     def test_parse_accepts_the_shapes_manifests_actually_carry(self):
@@ -308,6 +402,13 @@ class TestApiVersionCompatibility(unittest.TestCase):
     def test_parse_rejects_anything_unusable(self):
         for bad in ("", "abc", "1.x", None, 3, [], " "):
             self.assertIsNone(parse_api_version(bad), bad)
+
+    def test_a_negative_segment_is_not_a_version(self):
+        # Version numbers are non-negative. Before this was checked, "1.-1"
+        # parsed to (1, -1) and then satisfied `minor <= server minor`.
+        for bad in ("1.-1", "-1.0", "0.-2"):
+            self.assertIsNone(parse_api_version(bad), bad)
+            self.assertFalse(api_version_supported(bad), bad)
 
     def test_supported_requires_an_equal_major_and_an_older_or_equal_minor(self):
         for good in ("1.0", "1", "1.0.0", "1.0.7"):

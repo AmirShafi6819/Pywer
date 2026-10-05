@@ -467,6 +467,14 @@ class Server:
             return
 
         if task_type != "CHUNK":
+            # Failures are reported above for every task type; a success that
+            # nothing consumes is the same blind spot from the other side. Chunk
+            # jobs are the only ones submitted today, so this should never fire -
+            # which is exactly why it must not be silent when it does.
+            log(
+                "Worker",
+                "no handler for successful task %s (session %s)" % (task_type, session_id),
+            )
             return
         cx, cz, payload = res
         try:

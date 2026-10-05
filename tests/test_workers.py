@@ -6,8 +6,11 @@ raises must still produce something, and the dispatcher must give the registrati
 back instead of stranding it or taking the tick loop down with it.
 """
 
+import contextlib
+import io
 import time
 import unittest
+from types import SimpleNamespace
 
 from pywer.player.session import Session
 from pywer.server.server import Server
@@ -28,6 +31,9 @@ class FakeChunkCache:
 
     def put(self, cx, cz, payload):
         self.stored[(cx, cz)] = payload
+
+    def get(self, cx, cz):
+        return self.stored.get((cx, cz))
 
 
 class ExplodingChunkCache:
@@ -69,6 +75,37 @@ def bare_dispatch_server(cache=None):
 def failed_coords(session):
     """The (cx, cz) pairs a session was told it lost, without the error objects."""
     return [(cx, cz) for cx, cz, _error in session.failed]
+
+
+class RecordingPool:
+    """A worker pool that records submissions instead of running them."""
+
+    def __init__(self):
+        self.submitted = []
+
+    def submit(self, task_type, session_id, job, *args):
+        self.submitted.append((task_type, session_id, args))
+
+
+def bare_session(pool=None):
+    """A Session carrying only its chunk-tracking state, built without a server."""
+    session = Session.__new__(Session)
+    session.rid = 7
+    session.center = (0, 0)
+    session.radius = 2
+    session.sent_chunks = set()
+    session.chunks_in_flight = set()
+    session.chunk_attempts = {}
+    session.chunk_retries = []
+    session.chunk_queue = []
+    session.chunk_send_queue = []
+    session.srv = SimpleNamespace(chunk_cache=FakeChunkCache(), worker_pool=pool)
+    return session
+
+
+def submitted_coords(pool):
+    """The coords in a RecordingPool's submissions, in submission order."""
+    return [(args[0], args[1]) for _task_type, _sid, args in pool.submitted]
 
 
 class TestWorkerPool(unittest.TestCase):
@@ -199,7 +236,7 @@ class TestWorkerDispatch(unittest.TestCase):
 
 class TestChunkSlotRelease(unittest.TestCase):
     def test_on_chunk_failed_releases_only_the_slot_it_names(self):
-        session = Session.__new__(Session)
+        session = bare_session()
         session.chunks_in_flight = {(3, 4), (5, 6)}
 
         session.on_chunk_failed(3, 4, RuntimeError("boom"))
@@ -209,14 +246,106 @@ class TestChunkSlotRelease(unittest.TestCase):
     def test_a_failed_chunk_is_neither_sent_nor_claimed(self):
         # queue_chunks() only re-queues a coord that is in neither set, so both
         # have to be clear for the chunk to ever be requested again.
-        session = Session.__new__(Session)
+        session = bare_session()
         session.chunks_in_flight = {(3, 4)}
-        session.sent_chunks = set()
 
         session.on_chunk_failed(3, 4, RuntimeError("boom"))
 
         self.assertNotIn((3, 4), session.chunks_in_flight)
         self.assertNotIn((3, 4), session.sent_chunks)
+
+
+class TestChunkRetry(unittest.TestCase):
+    """A failure has to recover on its own, and has to stop trying when it cannot.
+
+    queue_chunks() only runs on a spawn or a chunk-boundary crossing, so leaving
+    the coord alone means a hole under a player who never takes a step - while
+    re-queueing it outright means resubmitting a job that is failing for a reason
+    every time they do cross one.
+    """
+
+    def _fail(self, session, coord=(1, 1), error=RuntimeError("boom")):
+        session.chunks_in_flight.add(coord)
+        session.on_chunk_failed(coord[0], coord[1], error)
+
+    def test_a_failed_chunk_is_retried_without_the_player_moving(self):
+        pool = RecordingPool()
+        session = bare_session(pool)
+
+        self._fail(session, error=RuntimeError("sqlite locked"))
+
+        self.assertNotIn((1, 1), session.chunks_in_flight)
+        self.assertEqual(len(session.chunk_retries), 1)
+        ready_at, cx, cz = session.chunk_retries[0]
+        self.assertEqual((cx, cz), (1, 1))
+        self.assertGreater(ready_at, time.time(), "the retry must be scheduled, not immediate")
+
+        session._flush_chunk_retries()  # still inside the backoff window
+        self.assertEqual(pool.submitted, [])
+
+        session.chunk_retries[0] = (time.time() - 0.01, cx, cz)
+        session._flush_chunk_retries()
+
+        self.assertEqual(submitted_coords(pool), [(1, 1)])
+        self.assertIn((1, 1), session.chunks_in_flight)
+        self.assertEqual(session.chunk_retries, [])
+
+    def test_a_chunk_that_keeps_failing_is_given_up_on(self):
+        pool = RecordingPool()
+        session = bare_session(pool)
+        for _ in range(Session.CHUNK_MAX_ATTEMPTS + 5):
+            self._fail(session)
+            # Each retry gets its chance to run and fail again before the next
+            # one arrives, which is how this happens against a real worker.
+            while session.chunk_retries:
+                session.chunk_retries[0] = (time.time() - 1, 1, 1)
+                session._flush_chunk_retries()
+
+        self.assertEqual(len(pool.submitted), Session.CHUNK_MAX_ATTEMPTS - 1)
+        self.assertEqual(session.chunk_attempts[(1, 1)], Session.CHUNK_MAX_ATTEMPTS + 5)
+        self.assertEqual(session.chunk_retries, [])
+
+    def test_queue_chunks_never_asks_again_for_a_coord_that_gave_up(self):
+        pool = RecordingPool()
+        session = bare_session(pool)
+        for _ in range(Session.CHUNK_MAX_ATTEMPTS):
+            self._fail(session)
+        session.chunk_retries = []  # this is about queue_chunks, not the timer
+
+        session.queue_chunks()
+
+        coords = submitted_coords(pool)
+        self.assertNotIn((1, 1), coords)
+        self.assertEqual(len(coords), 24, "the rest of the 5x5 window is still asked for")
+
+    def test_attempt_counts_are_forgotten_once_the_coord_leaves_the_window(self):
+        # The table is bounded by where the player is, not by everywhere they have
+        # ever been - and coming back later re-tries a coord whose fault has had
+        # time to clear instead of staying poisoned forever.
+        pool = RecordingPool()
+        session = bare_session(pool)
+        for _ in range(Session.CHUNK_MAX_ATTEMPTS):
+            self._fail(session)
+        session.chunk_retries = []  # this is about queue_chunks, not the timer
+        session.center = (50, 50)
+
+        session.queue_chunks()
+
+        self.assertNotIn((1, 1), session.chunk_attempts)
+
+
+class TestUnclaimedWorkerResults(unittest.TestCase):
+    def test_a_success_nothing_consumes_is_reported(self):
+        # Failures are reported for every task type; a success that is silently
+        # dropped is the same blind spot from the other side.
+        srv = bare_dispatch_server()
+        srv.worker_pool = FakePool([("PING", 7, b"pong")])
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            srv.drain_workers()
+
+        self.assertIn("no handler for successful task PING", out.getvalue())
 
 
 if __name__ == "__main__":

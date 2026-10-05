@@ -74,14 +74,39 @@ class PluginManager:
         discovered: Dict[str, Dict[str, Any]] = {}
         file_map: Dict[str, Path] = {}
 
-        for pkg_file in self.plugins_dir.glob("*.pywer"):
+        # Sorted because the directory listing differs by filesystem and must not
+        # decide anything on its own - starting with which of two packages that
+        # claim one name is the one that gets loaded.
+        for pkg_file in sorted(self.plugins_dir.glob("*.pywer")):
             try:
                 manifest_data = PluginCompiler.inspect(pkg_file)
-                name = manifest_data["name"]
-                discovered[name] = manifest_data
-                file_map[name] = pkg_file
             except Exception as e:
                 print(f"[ERROR] [Plugin] Failed to read package '{pkg_file.name}': {e}")
+                continue
+            name = manifest_data.get("name") if isinstance(manifest_data, dict) else None
+            if not isinstance(name, str) or not name:
+                # manifest_data["name"] used to be read directly, so a package
+                # without a usable name raised KeyError and landed in the message
+                # above as an unreadable file - which also kept _manifest_error,
+                # the one place that formats refusals, from ever seeing it.
+                reason = (
+                    _manifest_error(manifest_data)
+                    if isinstance(manifest_data, dict)
+                    else None
+                )
+                print(
+                    f"[ERROR] [Plugin] Skipped '{pkg_file.name}': "
+                    f"{reason or 'manifest is not a plugin.json object'}"
+                )
+                continue
+            if name in discovered:
+                print(
+                    f"[ERROR] [Plugin] Skipped '{pkg_file.name}': name '{name}' "
+                    f"is already provided by '{file_map[name].name}'"
+                )
+                continue
+            discovered[name] = manifest_data
+            file_map[name] = pkg_file
 
         # 2. Refuse anything this server cannot serve, then order what is left.
         #    A refusal on a hard dependency takes its dependents down with it;
@@ -107,21 +132,11 @@ class PluginManager:
             manifest = discovered[p_name]
             hard = _dependency_names(manifest, "dependencies")
             soft = _dependency_names(manifest, "soft_dependencies")
-            # Visit dependencies first so their refusal is already known by the time
-            # this plugin's own refusal is decided below. Soft dependencies are
-            # visited only when present, which is what makes them optional.
+            # Walk dependencies first so that whatever is loadable is loadable
+            # before its dependents. Nothing is decided here - see below.
             for dep in hard + soft:
                 if dep in discovered:
                     visit(dep)
-
-            if p_name not in skipped:
-                for dep in hard:
-                    if dep not in discovered:
-                        skipped[p_name] = f"missing hard dependency '{dep}'"
-                        break
-                    if dep in skipped:
-                        skipped[p_name] = f"dependency '{dep}' was skipped: {skipped[dep]}"
-                        break
 
             visiting.remove(p_name)
             visited.add(p_name)
@@ -130,6 +145,31 @@ class PluginManager:
         for p_name in list(discovered.keys()):
             if p_name not in visited:
                 visit(p_name)
+
+        # Refusals are decided in one pass over the finished order rather than
+        # inside the walk above. Deciding them while a node was still being
+        # entered made the answer depend on where the walk started: around a
+        # cycle A -> B -> A where B also lacks a hard dependency, A was checked
+        # before B had refused, so A loaded without B - and whether it did came
+        # down to the order glob() happened to return the files in. Sweeping to a
+        # fixed point gives one answer for every discovery order. Monotone: a
+        # name only ever enters skipped, so this terminates.
+        changed = True
+        while changed:
+            changed = False
+            for p_name in load_order:
+                if p_name in skipped:
+                    continue
+                for dep in _dependency_names(discovered[p_name], "dependencies"):
+                    if dep not in discovered:
+                        reason = f"missing hard dependency '{dep}'"
+                    elif dep in skipped:
+                        reason = f"dependency '{dep}' was skipped: {skipped[dep]}"
+                    else:
+                        continue
+                    skipped[p_name] = reason
+                    changed = True
+                    break
 
         # 3. Virtual load each plugin in dependency order
         loaded: List[PluginBase] = []
